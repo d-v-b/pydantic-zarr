@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from typing import (
+    TYPE_CHECKING,
     Any,
     Generic,
     Literal,
@@ -12,12 +12,16 @@ from typing import (
     overload,
 )
 
-import numpy.typing as npt
-import zarr
-from zarr.storage import BaseStore
-
 from pydantic_zarr.base import StrictBase
-from pydantic_zarr.zarr_v2.v2 import DTypeString
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+    import numpy.typing as npt
+    import zarr
+    from zarr.storage import BaseStore
+
+    from pydantic_zarr.zarr_v2.array import DTypeString
 
 TAttr = TypeVar("TAttr", bound=dict[str, Any])
 TItem = TypeVar("TItem", bound=Union["GroupSpec", "ArraySpec"])

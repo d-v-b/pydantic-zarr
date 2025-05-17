@@ -1,3 +1,4 @@
-from .v2 import ArraySpec, GroupSpec, LeafGroupSpec
+from .array import ArraySpec
+from .group import GroupSpec, LeafGroupSpec
 
 __all__ = ["ArraySpec", "GroupSpec", "LeafGroupSpec"]

@@ -2,13 +2,9 @@ from collections.abc import Mapping
 from typing import Literal, overload
 
 from pydantic_zarr.base import (
-    ArrayLike,
-    ArrayV2Config,
-    ArrayV3Config,
-    NamedConfig,
-    TShape,
     guess_chunks,
 )
+from pydantic_zarr.types import ArrayLike, ArrayV2Config, ArrayV3Config, NamedConfig, TShape
 
 
 def get_attributes(array: ArrayLike[TShape]) -> Mapping[str, object]:

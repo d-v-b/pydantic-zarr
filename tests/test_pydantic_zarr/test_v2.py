@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -15,15 +15,14 @@ from pydantic import ValidationError
 from typing_extensions import TypedDict
 from zarr.errors import ContainsGroupError
 
-from pydantic_zarr.base import ArrayV2Config
-from pydantic_zarr.engine import zarrify_array_v2
-from pydantic_zarr.zarr_v2.v2 import (
+from pydantic_zarr.backend import zarrify_array_v2
+from pydantic_zarr.zarr_v2.array import (
     ArraySpec,
-    GroupSpec,
-    from_flat,
-    from_zarr,
-    to_flat,
 )
+from pydantic_zarr.zarr_v2.group import GroupSpec, from_flat, to_flat
+
+if TYPE_CHECKING:
+    from pydantic_zarr.types import ArrayV2Config
 
 ArrayMemoryOrder = Literal["C", "F"]
 DimensionSeparator = Literal[".", "/"]

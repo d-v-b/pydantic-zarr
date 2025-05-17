@@ -4,18 +4,18 @@ import asyncio
 import json
 from collections import defaultdict
 from collections.abc import Coroutine, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self, TypeVar
 
 import numpy as np
 import tensorstore as ts
 
-from pydantic_zarr.base import ArrayMetadataV2Config
-from pydantic_zarr.zarrio import ZarrV2IO
+from pydantic_zarr._io import ZarrV2Writer
+from pydantic_zarr.types import ArrayMetadataV2Config, ArrayV2Config
 
-from .models import DataType, KVStore, ZarrDriver
+from .models import DataType, KVStoreParams, ZarrDriverParams
 
 if TYPE_CHECKING:
-    from pydantic_zarr.base import ArrayV2Config, GroupV2Config
+    from pydantic_zarr.types import GroupV2Config
 
 
 V2_ARRAY_KEY = b".zarray"
@@ -43,12 +43,27 @@ async def read_group_v2(store: ts.KvStore) -> GroupV2Config:
     attributes = await read_attrs_v2(store)
     return zgroup_meta | {"attributes": attributes}  # type: ignore[no-any-return]
 
+T = TypeVar("T")
+def tuplize_lists(d: list[T]) -> tuple[T, ...]:
+    return tuple(d)
+
+def tuplize_lists_hook(value: dict[str, object]) -> dict[str, object]:
+    """
+    Convert lists in a dictionary to tuples.
+    """
+    out: dict[str, object] = {}
+    for k,v in value.items():
+        if isinstance(v, list):
+            out[k] = tuplize_lists(v)
+        else:
+            out[k] = v
+    return out
 
 async def read_array_v2(store: ts.KvStore) -> ArrayV2Config:
     zarray_result = await store.read(V2_ARRAY_KEY)
     if zarray_result.state == "missing":
         raise FileNotFoundError(f"No {V2_ARRAY_KEY.decode()} file found in the store.")
-    zarray_metadata: ArrayMetadataV2Config = json.loads(zarray_result.value)
+    zarray_metadata: ArrayMetadataV2Config = json.loads(zarray_result.value, object_hook=tuplize_lists_hook)
     attributes = await read_attrs_v2(store)
     return zarray_metadata | {"attributes": attributes}  # type: ignore[return-value]
 
@@ -120,7 +135,7 @@ async def read_members_v2(store: ts.KvStore) -> dict[bytes, ArrayV2Config | Grou
     }
 
 
-async def write_group_v2(metadata: GroupV2Config, *, kvstore: KVStore) -> Any:
+async def write_group_v2(metadata: GroupV2Config, *, kvstore: ts.KvStore) -> Any:
     futs = []
     attrs_meta = metadata.pop("attributes", None)
     zgroup_meta = metadata
@@ -131,39 +146,54 @@ async def write_group_v2(metadata: GroupV2Config, *, kvstore: KVStore) -> Any:
     return await asyncio.gather(*futs, return_exceptions=True)
 
 
-async def write_array_v2(
-    metadata: ArrayV2Config,
+async def write_array_metadata_v2(
+    metadata: ArrayMetadataV2Config,
     *,
-    kvstore: KVStore | dict[str, Any],
+    kvstore: KVStoreParams | ts.KvStore,
+    context: dict[str, object] = None,
     open: bool = True,
     create: bool = False,
     delete_existing: bool = False,
     assume_metadata: bool = False,
     assume_cached_metadata: bool = False,
 ) -> ts.TensorStore:
-    spec = ZarrDriver(
-        driver="zarr",
-        kvstore=kvstore,
-        metadata=metadata,
-        open=open,
-        create=create,
-        delete_existing=delete_existing,
-        assume_metadata=assume_metadata,
-        assume_cached_metadata=assume_cached_metadata,
-    )
-    return await ts.open(spec.model_dump(exclude_none=True))
+    kvstore_spec: KVStoreParams
+    if isinstance(kvstore, ts.KvStore):
+        kvstore_spec = kvstore.spec(retain_context=True).to_json()
+    else:
+        kvstore_spec = kvstore
+    spec: ZarrDriverParams = {
+        'driver': "zarr",
+        'kvstore': kvstore_spec,
+        'metadata': metadata,
+        'open': open,
+        'create': create,
+        'delete_existing': delete_existing,
+        'assume_metadata' : assume_metadata,
+        'assume_cached_metadata':assume_cached_metadata,
+    }
+    return await ts.open(spec, context=context)
 
 
-class TensorstoreZarrIO(ZarrV2IO):
+class TensorstoreZarrV2Writer(ZarrV2Writer):
     """
-    Tensorstore Zarr IO backend for reading and writing Zarr arrays and groups.
+    Tensorstore Zarr IO backend for writing Zarr arrays and groups.
     """
+    store: ts.KvStore
 
-    def __init__(self, store: KVStore) -> None:
+    def __init__(self, store: ts.KvStore) -> None:
+        # todo: does this need to be a kvstore or a spec thereof
         self.store = store
 
     async def write_array(self, *, path: str, metadata: ArrayV2Config) -> ts.TensorStore:
-        return await write_array_v2(metadata, kvstore=self.store / path)
+        meta_copy = metadata.copy()
+        attributes: dict[str, object] = meta_copy.pop("attributes", {})
+        array_meta: ArrayV2Config = meta_copy
+        return await write_array_metadata_v2(array_meta, kvstore=self.store / path, create=True)
 
     async def write_group(self, *, path: str, metadata: GroupV2Config):
-        return await super().write_group(path=path, metadata=metadata)
+        return await write_group_v2(metadata=metadata, kvstore=self.store / path)
+
+    @classmethod
+    def from_url(cls, url: str) -> Self:
+        return cls(store=ts.KvStore.open(url).result())

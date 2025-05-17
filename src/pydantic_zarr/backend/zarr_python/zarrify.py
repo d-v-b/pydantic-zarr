@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 import numpy as np
-import zarr
 
-from pydantic_zarr.base import ArrayV2Config, ArrayV3Config, NamedConfig
+from pydantic_zarr.types import ArrayV3Config
+from pydantic_zarr.types import ArrayV2Config, NamedConfig
+
+if TYPE_CHECKING:
+    import zarr
 
 
 def get_chunks(value: zarr.Array) -> tuple[int, ...]:

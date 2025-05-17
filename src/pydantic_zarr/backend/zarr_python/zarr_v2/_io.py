@@ -9,13 +9,18 @@ from typing import TYPE_CHECKING, Any
 
 import zarr
 from zarr import create_group
+from zarr.core.metadata import ArrayV2Metadata
+from zarr.core.sync import sync
 from zarr.errors import ContainsArrayError, ContainsGroupError
+import zarr.storage
 from zarr.storage._common import StorePath, contains_array, contains_group
 
-from pydantic_zarr.zarr_v2.v2 import ArraySpec, BaseAttr, BaseMember, GroupSpec, TAttr
+from pydantic_zarr._io import ZarrV2Writer
 
 if TYPE_CHECKING:
     from zarr.abc.store import Store
+
+    from pydantic_zarr.types import ArrayLike, ArrayV2Config, GroupV2Config
 
 
 async def create_spec(node: zarr.Group | zarr.Array) -> GroupSpec[Any, Any] | ArraySpec[Any]:
@@ -145,8 +150,12 @@ def create_groupspec(group: zarr.Group, *, depth: int = -1) -> GroupSpec[BaseAtt
     return result
 
 
-async def write_group(
-    spec: GroupSpec[Any, Any], store: Store, path: str, *, overwrite: bool = False, **kwargs: object
+async def write_group_v2(
+    metadata: GroupV2Config,
+    store: StorePath,
+    *,
+    overwrite: bool = False,
+    **kwargs: object
 ) -> zarr.Group:
     """
     Serialize this `GroupSpec` to a Zarr group at a specific path in a `zarr.BaseStore`.
@@ -169,12 +178,11 @@ async def write_group(
 
     """
 
-    spec_dict = spec.model_dump(exclude={"members": True})
-    attrs = spec_dict.pop("attributes")
+    attrs = metadata.pop("attributes")
     if not overwrite:
         if await contains_group(StorePath(store, path), zarr_format=2):
             extant_group = zarr.group(store, path=path)
-            if not spec.like(extant_group, exclude={"members"}):
+            if not metadata.like(extant_group, exclude={"members"}):
                 msg = (
                     f"A group already exists at path {path}. "
                     "That group is structurally dissimilar to the group you are trying to store."
@@ -195,19 +203,12 @@ async def write_group(
     else:
         result = create_group(store=store, overwrite=overwrite, path=path, attributes=attrs)
 
-    # consider raising an exception if a partial GroupSpec is provided
-    if spec.members is not None:
-        for name, member in spec.members.items():
-            subpath = "/".join([path, name])
-            write_node(member, store, subpath, overwrite=overwrite, **kwargs)
-
     return result
 
 
-async def write_array(
-    spec: ArraySpec[TAttr],
-    store: Store,
-    path: str,
+async def write_array_v2(
+    metadata: ArrayV2Config,
+    store: StorePath,
     *,
     overwrite: bool = False,
     **kwargs: object,
@@ -232,16 +233,13 @@ async def write_array(
         A Zarr array that is structurally identical to `self`.
     """
 
-    spec_dict = spec.model_dump()
-    attrs = spec_dict.pop("attributes")
+    if await contains_array(store, zarr_format=2):
+        extant_array = zarr.open_array(store, mode="r")
 
-    if await contains_array(StorePath(store, path), zarr_format=2):
-        extant_array = zarr.open_array(store, path=path, mode="r")
-
-        if not spec.like(extant_array):
+        if extant_array.metadata.to_dict() != extant_array:
             if not overwrite:
                 msg = (
-                    f"An array already exists at path {path}. "
+                    f"An array already exists at path {store.path}. "
                     "That array is structurally dissimilar to the array you are trying to "
                     "store. Call to_zarr with overwrite=True to overwrite that array."
                 )
@@ -251,6 +249,26 @@ async def write_array(
                 # extant_array is read-only, so we make a new array handle that
                 # takes **kwargs
                 return zarr.open_array(store=extant_array.store, path=extant_array.path, **kwargs)
-    result = zarr.create(store=store, path=path, overwrite=overwrite, **spec_dict, **kwargs)
-    result.attrs.put(attrs)
-    return result
+    a_arr = zarr.AsyncArray(
+        metadata=ArrayV2Metadata.from_dict(metadata),
+        store_path=store,
+        )
+    await a_arr._save_metadata(a_arr.metadata)
+    return zarr.Array(a_arr)
+
+class ZarrPythonZarrV2Writer(ZarrV2Writer):
+    store: StorePath
+
+    def __init__(self, store: StorePath) -> None:
+        self.store = store
+
+    async def write_array(self, *, path: str, metadata: ArrayV2Config) -> zarr.Array:
+        return await write_array_v2(metadata=metadata, store=self.store / path)
+
+    async def write_group(self, *, path: str, metadata: GroupV2Config) -> zarr.Group:
+        return await write_group_v2(metadata, store=self.store / path)
+
+    @classmethod
+    def from_url(cls, url: str) -> ZarrPythonZarrV2Writer:
+        spath = sync(zarr.storage._common.make_store_path(url))
+        return cls(store=spath.store)

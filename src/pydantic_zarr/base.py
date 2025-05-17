@@ -5,13 +5,9 @@ from collections.abc import Mapping
 from typing import (
     TYPE_CHECKING,
     Any,
-    Generic,
     Literal,
-    NotRequired,
-    Protocol,
     TypeAlias,
     TypeVar,
-    runtime_checkable,
 )
 
 if TYPE_CHECKING:
@@ -21,25 +17,16 @@ if TYPE_CHECKING:
     ZArrayLike = zarr.Array | tensorstore.TensorStore | "ArrayLike[TShape]"
 
 from pydantic import BaseModel, ConfigDict
-from typing_extensions import TypedDict
-
-
-class StoreSpec(TypedDict):
-    url: str
-    engine: NotRequired[Literal["tensorstore", "zarr-python"]]
-    configuration: NotRequired[Mapping[str, Any]]
 
 
 if TYPE_CHECKING:
     from tensorstore import KvStore
     from zarr.abc.store import Store
 
-    StoreLike = Store | KvStore | str | StoreSpec
+    StoreLike = Store | KvStore | str | "StoreSpec"
 
 __all__ = [
     "AccessMode",
-    "ArrayV2Config",
-    "ArrayV3Config",
     "IncEx",
     "StrictBase",
     "ensure_key_no_path",
@@ -51,10 +38,8 @@ IncEx: TypeAlias = set[int] | set[str] | dict[int, Any] | dict[str, Any] | None
 
 AccessMode: TypeAlias = Literal["w", "w+", "r", "a"]
 
-
 class StrictBase(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
-
 
 def ensure_member_name(data: Any) -> str:
     """
@@ -90,27 +75,6 @@ def model_like(a: BaseModel, b: BaseModel, exclude: IncEx = None, include: IncEx
     return a_dict == b_dict
 
 
-TShape = TypeVar("TShape", bound=tuple[int, ...])
-
-
-@runtime_checkable
-class ArrayLike(Protocol, Generic[TShape]):
-    # shape has to be annotated with a generic type parameter for numpy
-    shape: TShape
-
-    @property
-    def dtype(self) -> Any: ...
-
-
-class GroupLike(Protocol):
-    @property
-    def attrs(self) -> Mapping[str, Any]: ...
-
-    def members(
-        self, max_depth: int | None
-    ) -> tuple[tuple[str, ArrayLike[Any] | GroupLike], ...]: ...
-
-
 def guess_chunks(shape: tuple[int, ...], item_size: int) -> tuple[int, ...]:
     """
     Calculate suitable automatic chunk sizes for an N-dimensional array.
@@ -142,64 +106,3 @@ def guess_chunks(shape: tuple[int, ...], item_size: int) -> tuple[int, ...]:
     return tuple(chunk_sizes)
 
 
-class CodecConfigV2(TypedDict, total=False):
-    id: str
-
-
-class ArrayMetadataV2Config(TypedDict):
-    zarr_format: Literal[2]
-    shape: tuple[int, ...]
-    dtype: str | tuple[object]
-    chunks: tuple[int, ...]
-    fill_value: object
-    order: Literal["C", "F"]
-    compressor: CodecConfigV2 | None
-    filters: tuple[CodecConfigV2] | None
-    dimension_separator: Literal["/", "."]
-
-
-class ArrayV2Config(ArrayMetadataV2Config):
-    attributes: NotRequired[Mapping[str, object]]
-
-
-class GroupMetadataV2Config(TypedDict):
-    zarr_format: Literal[2]
-
-
-class GroupV2Config(GroupMetadataV2Config):
-    attributes: NotRequired[Mapping[str, object]]
-    members: NotRequired[Mapping[str, ArrayV2Config | GroupV2Config]]
-
-
-class NamedConfig(TypedDict):
-    name: str
-    configuration: NotRequired[Mapping[str, object]]
-
-
-class ArrayV3Config(TypedDict):
-    zarr_format: Literal[3]
-    node_type: Literal["array"]
-    shape: tuple[int, ...]
-    data_type: str | NamedConfig
-    fill_value: object
-    chunk_grid: NamedConfig
-    chunk_key_encoding: NamedConfig
-    codecs: tuple[NamedConfig, ...]
-    attributes: Mapping[str, object]
-    dimension_names: tuple[str] | None
-
-
-class GroupV3Config(TypedDict):
-    zarr_format: Literal[3]
-    node_type: Literal["group"]
-    attributes: Mapping[str, object]
-
-
-class RegularChunks(TypedDict):
-    read_shape: tuple[int, ...]
-    write_shape: tuple[int, ...] | None
-
-
-class RectilinearChunks(TypedDict):
-    read_shape: tuple[tuple[int, ...], ...]
-    write_shape: tuple[tuple[int, ...], ...] | None

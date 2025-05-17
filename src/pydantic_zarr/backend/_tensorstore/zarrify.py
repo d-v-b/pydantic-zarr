@@ -4,19 +4,20 @@ from typing import Literal, overload
 
 import tensorstore as ts
 
-from pydantic_zarr.base import ArrayV2Config, ArrayV3Config, NamedConfig
+from pydantic_zarr.types import ArrayV3Config
+from pydantic_zarr.types import ArrayV2Config, NamedConfig
 
 
 def zarrify_v3(array: ts.TensorStore) -> ArrayV3Config:
     chunk_grid: NamedConfig = {
         "name": "regular",
-        "configuration": {"chunk_shape": array.schema.chunk_layout.read_chunk.shape},
+        "configuration": {"chunk_shape": tuple(array.schema.chunk_layout.read_chunk.shape)},
     }
     chunk_key_encoding: NamedConfig = {"name": "default", "configuration": {"separator": "/"}}
     return {
         "zarr_format": 3,
         "node_type": "array",
-        "shape": array.shape,
+        "shape": tuple(array.shape),
         "data_type": array.dtype.to_json(),
         "attributes": {},
         "codecs": (),
@@ -30,9 +31,9 @@ def zarrify_v3(array: ts.TensorStore) -> ArrayV3Config:
 def zarrify_v2(array: ts.TensorStore) -> ArrayV2Config:
     return {
         "zarr_format": 2,
-        "shape": array.shape,
+        "shape": tuple(array.shape),
         "dtype": array.dtype.to_json(),
-        "chunks": array.schema.chunk_layout.read_chunk.shape,
+        "chunks": tuple(array.schema.chunk_layout.read_chunk.shape),
         "attributes": {},
         "filters": None,
         "compressor": None,
