@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from typing import Any
 
 import numpy as np
 import pytest
 import zarr
 from pydantic import ValidationError
-
+import numpy.typing as npt
 from pydantic_zarr.core import tuplify_json
 from pydantic_zarr.v3 import (
     AnyArraySpec,
     AnyGroupSpec,
+    AnyNamedConfig,
     ArraySpec,
     DefaultChunkKeyEncoding,
     DefaultChunkKeyEncodingConfig,
@@ -19,10 +21,14 @@ from pydantic_zarr.v3 import (
     NamedConfig,
     RegularChunking,
     RegularChunkingConfig,
+    auto_attributes,
+    auto_chunk_grid,
     auto_codecs,
+    auto_fill_value,
+    parse_dtype_v3,
 )
 
-from .conftest import DTYPE_EXAMPLES_V3, DTypeExample
+from .conftest import DTYPE_EXAMPLES_V3, DTypeExample, FakeArray, FakeDaskArray, FakeXarray
 
 
 def test_serialize_deserialize() -> None:
@@ -45,30 +51,68 @@ def test_serialize_deserialize() -> None:
     GroupSpec(attributes=group_attributes, members={"array": array_spec})
 
 
-def test_from_array() -> None:
-    array = np.arange(10)
-    array_spec = ArraySpec.from_array(array)
+@pytest.mark.parametrize(
+    "array",
+    [
+        np.zeros((100), dtype="uint8"),
+        ArraySpec.from_array(np.zeros((100), dtype="uint8")),
+        FakeArray(shape=(11,), dtype=np.dtype("float64")),
+        FakeDaskArray(shape=(22,), dtype=np.dtype("uint8"), chunksize=(11,)),
+        FakeXarray(shape=(22,), dtype=np.dtype("uint8"), chunksize=(11,), attrs={"foo": "bar"}),
+    ],
+)
+@pytest.mark.parametrize("chunk_grid", ["omit", "auto", {"name": "regular", "configuration": {"chunk_shape": (10,)}}])
+@pytest.mark.parametrize("attributes", ["omit", "auto", {"foo": 10}])
+@pytest.mark.parametrize("fill_value", ["omit", "auto", 15])
+@pytest.mark.parametrize("codecs", ["omit", "auto", {"name": "GZip", "configuration": {"level": 1}}])
+@pytest.mark.parametrize("dimension_names", ["omit", "auto", ])
+def test_array_spec_from_array(
+    *,
+    array: npt.NDArray[Any],
+    chunk_grid: str | AnyNamedConfig,
+    attributes: str | dict[str, object],
+    fill_value: object,
+    codecs: list[AnyNamedConfig | str],
+) -> None:
+    auto_options = ("omit", "auto")
+    kwargs_out: dict[str, object] = {}
 
-    assert array_spec == ArraySpec(
-        zarr_format=3,
-        node_type="array",
-        attributes={},
-        shape=(10,),
-        data_type="int64",
-        chunk_grid=RegularChunking(
-            name="regular", configuration=RegularChunkingConfig(chunk_shape=(10,))
-        ),
-        chunk_key_encoding=DefaultChunkKeyEncoding(
-            name="default", configuration=DefaultChunkKeyEncodingConfig(separator="/")
-        ),
-        fill_value=0,
-        codecs=auto_codecs(array),
-        storage_transformers=(),
-        dimension_names=None,
-    )
-    # check that we can write this array to zarr
-    # TODO: fix type of the store argument in to_zarr
-    array_spec.to_zarr(store={}, path="")  # type: ignore[arg-type]
+    kwargs_out["chunk_grid"] = chunk_grid
+    kwargs_out["attributes"] = attributes
+    kwargs_out["fill_value"] = fill_value
+    kwargs_out["codecs"] = codecs
+
+    # remove all the keyword arguments that should be defaulted
+    kwargs_out = dict(filter(lambda kvp: kvp[1] != "omit", kwargs_out.items()))
+
+    spec = ArraySpec.from_array(array, **kwargs_out)
+    # arrayspec should round-trip from_array with no arguments
+    assert spec.from_array(spec) == spec
+
+    assert spec.data_type == parse_dtype_v3(array.dtype.str)
+    assert np.dtype(spec.dtype) == array.dtype
+
+    assert spec.shape == array.shape
+
+    if chunk_grid in auto_options:
+        assert spec.chunk_grid == auto_chunk_grid(array)
+    else:
+        assert spec.chunk_grid == chunk_grid
+
+    if attributes in auto_options:
+        assert spec.attributes == auto_attributes(array)
+    else:
+        assert spec.attributes == attributes
+
+    if fill_value in auto_options:
+        assert spec.fill_value == auto_fill_value(array)
+    else:
+        assert spec.fill_value == fill_value
+
+    if codecs in auto_options:
+        assert spec.codecs == auto_codecs(array)
+    else:
+        assert spec.codecs == codecs
 
 
 def test_arrayspec_no_empty_codecs() -> None:

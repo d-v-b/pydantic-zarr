@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from typing import Any
 import warnings
 from dataclasses import dataclass
 from importlib.metadata import version
 
+import numpy as np
 from packaging.version import Version
 
 ZARR_PYTHON_VERSION = Version(version("zarr"))
@@ -100,3 +102,27 @@ else:
 
     DTYPE_EXAMPLES_V2 = tuple(v2_examples)
     DTYPE_EXAMPLES_V3 = tuple(v3_examples)
+
+
+@dataclass
+class FakeArray:
+    shape: tuple[int, ...]
+    dtype: np.dtype[Any]
+
+
+@dataclass
+class WithAttrs:
+    attrs: dict[str, Any]
+
+
+@dataclass
+class WithChunksize:
+    chunksize: tuple[int, ...]
+
+
+@dataclass
+class FakeDaskArray(FakeArray, WithChunksize): ...
+
+
+@dataclass
+class FakeXarray(FakeDaskArray, WithAttrs): ...

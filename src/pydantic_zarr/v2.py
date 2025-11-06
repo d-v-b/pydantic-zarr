@@ -261,6 +261,10 @@ class ArraySpec(NodeSpec, Generic[TAttr]):
 
 
         """
+        # Fast path for array spec object
+        if isinstance(array, ArraySpec):
+            return cls(**array.model_dump())
+
         attributes_actual: BaseModel | Mapping[str, object]
         shape_actual = array.shape
         dtype_actual = array.dtype

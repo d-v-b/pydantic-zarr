@@ -279,6 +279,10 @@ class ArraySpec(NodeSpec, Generic[TAttr]):
         An instance of ArraySpec with properties derived from the provided array.
 
         """
+        # Fast path for array spec object
+        if isinstance(array, ArraySpec):
+            return cls(**array.model_dump())
+
         if attributes == "auto":
             attributes_actual = cast(TAttr, auto_attributes(array))
         else:

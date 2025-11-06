@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from zarr.errors import ContainsArrayError, ContainsGroupError
 
 from pydantic_zarr.core import tuplify_json
+from tests.test_pydantic_zarr.conftest import FakeArray, FakeDaskArray, FakeXarray
 
 from .conftest import DTYPE_EXAMPLES_V2, ZARR_PYTHON_VERSION, DTypeExample
 
@@ -21,7 +22,6 @@ if TYPE_CHECKING:
     from typing import Literal
 
 import sys
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
@@ -190,34 +190,11 @@ def test_array_spec(
     assert spec_2.to_zarr(store, path="foo").read_only is False
 
 
-@dataclass
-class FakeArray:
-    shape: tuple[int, ...]
-    dtype: np.dtype[Any]
-
-
-@dataclass
-class WithAttrs:
-    attrs: dict[str, Any]
-
-
-@dataclass
-class WithChunksize:
-    chunksize: tuple[int, ...]
-
-
-@dataclass
-class FakeDaskArray(FakeArray, WithChunksize): ...
-
-
-@dataclass
-class FakeXarray(FakeDaskArray, WithAttrs): ...
-
-
 @pytest.mark.parametrize(
     "array",
     [
         np.zeros((100), dtype="uint8"),
+        ArraySpec.from_array(np.zeros((100), dtype="uint8")),
         FakeArray(shape=(11,), dtype=np.dtype("float64")),
         FakeDaskArray(shape=(22,), dtype=np.dtype("uint8"), chunksize=(11,)),
         FakeXarray(shape=(22,), dtype=np.dtype("uint8"), chunksize=(11,), attrs={"foo": "bar"}),
