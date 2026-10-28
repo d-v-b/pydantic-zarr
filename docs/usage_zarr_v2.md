@@ -274,6 +274,25 @@ print(group.to_metadata_json())
 #> {'zarr_format': 2, 'attributes': {'bar': True}}
 ```
 
+## Stored metadata documents
+
+`to_stored_metadata_json` returns a node's metadata the way a Zarr store holds
+it: a mapping from each store key to the JSON document stored there. For an
+array, that is `.zarray` (the `to_metadata_json` document without
+`attributes`) and `.zattrs` (the attributes), typed as
+`pydantic_zarr.v2.ZarrV2ArrayStoredJSON`; for a group, `.zgroup` and
+`.zattrs`, typed as `pydantic_zarr.v2.ZarrV2GroupStoredJSON`. `.zattrs` is
+included even when the attributes are empty, as zarr-python writes it. Like
+`to_metadata_json`, it leaves out a group's members.
+
+```python
+from pydantic_zarr.v2 import GroupSpec
+
+group = GroupSpec(attributes={"bar": True})
+print(group.to_stored_metadata_json())
+#> {'.zgroup': {'zarr_format': 2}, '.zattrs': {'bar': True}}
+```
+
 ## Comparing `GroupSpec` and `ArraySpec` models
 
 `GroupSpec` and `ArraySpec` both have `like` methods that take another `GroupSpec` or `ArraySpec` as an argument and return `True` (the models are like each other) or `False` (the models are not like each other).
