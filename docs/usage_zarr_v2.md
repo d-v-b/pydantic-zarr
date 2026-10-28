@@ -310,10 +310,10 @@ To write a hierarchy's metadata, write each document as JSON at its key
 under the hierarchy's root. `json.dumps` writes the tuples in the documents as
 JSON arrays. It writes a non-finite float in the attributes (`float("nan")`)
 as the bare token `NaN`, as zarr-python does, which strict JSON parsers
-reject; pass `allow_nan=False` to refuse such attributes instead. The same
-holds for a fill value given as a non-finite float, which a v2 spec keeps as
-given; give it as a string (`"NaN"`, `"Infinity"` or `"-Infinity"`), the
-spelling the Zarr V2 spec requires.
+reject; pass `allow_nan=False` to refuse such attributes instead. Fill values
+need no care: a spec holds a non-finite fill value as a string (`"NaN"`,
+`"Infinity"` or `"-Infinity"`), the spelling the Zarr V2 spec requires, however
+it was given.
 
 ```python
 import json
@@ -334,6 +334,34 @@ with tempfile.TemporaryDirectory() as root:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(document))
     assert GroupSpec.from_zarr(zarr.open_group(root, mode="r")) == group
+```
+
+## Validation
+
+An `ArraySpec` is validated as a whole Zarr V2 array metadata document, via
+[`zarr-metadata`](https://pypi.org/project/zarr-metadata/), so a spec holds only
+what a `.zarray` document can store. Among other things, its fill value must be
+one its dtype accepts. Before that check, the fill value is put in its Zarr V2
+JSON form: numpy scalars become Python scalars, complex numbers become
+`(real, imaginary)` pairs, and non-finite floats become `"NaN"`, `"Infinity"`
+or `"-Infinity"`. A spec built without a fill value gets 0 when its dtype
+accepts 0, and `None` otherwise.
+
+```python
+import numpy as np
+from pydantic import ValidationError
+
+from pydantic_zarr.v2 import ArraySpec
+
+print(ArraySpec(shape=(4,), chunks=(2,), dtype="<c8", fill_value=np.complex64(np.nan)).fill_value)
+#> ('NaN', 0.0)
+print(ArraySpec(shape=(4,), chunks=(2,), dtype="|b1").fill_value)
+#> None
+try:
+    ArraySpec(shape=(4,), chunks=(2,), dtype="<i2", fill_value=1.5)
+except ValidationError as e:
+    print(e.errors()[0]["msg"].splitlines()[-1])
+    #> fill_value: expected an integer or null, got 1.5
 ```
 
 ## Comparing `GroupSpec` and `ArraySpec` models
