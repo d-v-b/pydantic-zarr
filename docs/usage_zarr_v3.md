@@ -157,6 +157,10 @@ Notes for type checkers and for `TypedDict` members:
   `extra="forbid"` setting does not apply to the `TypedDict`. Type checkers
   accept the decorator, where they refuse a `__pydantic_config__` assignment
   in the `TypedDict` body.
+- **Member order.** pydantic builds a `TypedDict` in declaration order,
+  followed by any extra items. So a group whose members type is a
+  `TypedDict` holds its members in that order, not in the order they were
+  given. Zarr gives member order no meaning, and comparing specs ignores it.
 - **Read-only members.** A spec is frozen, but type checkers let code assign
   to a key of a `TypedDict`, so `group.members["band"] = other` type-checks.
   Declare the items `ReadOnly[...]` (from `typing_extensions`) for checkers to
@@ -370,6 +374,17 @@ back as the store holds them. Two functions connect them to the specs:
 ```python
 --8<-- "examples/zarr_io.py:read"
 ```
+
+A stored document that breaks the spec is refused, as it should be.
+zarr-python 3.0 writes `"consolidated_metadata": null` into every group,
+which the spec does not allow. `read_documents` never passes it on, because it
+leaves consolidated metadata out altogether (see below). A reader that takes a
+group's `zarr.json` whole, such as one that reads the files of a store
+directly, repairs it with
+[`normalize_group_metadata`][pydantic_zarr.v3.normalize_group_metadata] before
+`from_stored_metadata_json`. That routine takes a JSON value and gives one
+back, and each repair it knows is asked for by a keyword:
+`normalize_null_consolidated_metadata` (on by default) drops the null.
 
 Together they round-trip a hierarchy through any zarr-python store:
 
