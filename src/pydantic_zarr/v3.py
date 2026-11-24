@@ -25,9 +25,11 @@ from pydantic import (
     BaseModel,
     BeforeValidator,
     Field,
+    SerializationInfo,
     SerializeAsAny,
     SerializerFunctionWrapHandler,
     ValidationInfo,
+    field_serializer,
     model_serializer,
     model_validator,
 )
@@ -128,6 +130,7 @@ from pydantic_zarr.core import (
     node_patch,
     read_attribute,
     resolve_member_path,
+    serialize_members,
     split_store_key,
     stored_array,
     stored_root,
@@ -149,11 +152,8 @@ if TYPE_CHECKING:
 # serialized through the base schema, which silently dumps {}.
 type TBaseAttr = Mapping[str, object] | SerializeAsAny[BaseModel]
 # BaseGroupSpec is not a member type. A GroupSpec is a complete hierarchy,
-# and a group with unknown members is never part of one. The union is
-# SerializeAsAny so that a member is dumped by its own class. Through the
-# union's schema, the fields that a subclass of GroupSpec or ArraySpec adds
-# would be left out of `model_dump`, and so out of `replace` and `diff`.
-type TBaseItem = SerializeAsAny[Union["GroupSpec", "ArraySpec"]]
+# and a group with unknown members is never part of one.
+type TBaseItem = Union["GroupSpec", "ArraySpec"]
 # The widest members mapping: any names, each member a GroupSpec or an ArraySpec.
 type TBaseMembers = Mapping[str, TBaseItem]
 
@@ -1921,6 +1921,14 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
     # An unparameterized GroupSpec() then has the default members type.
     members: TMembers = Field(default=cast("TMembers", {}), validate_default=True)
 
+    # No return annotation, as on `StrictBase._serialize_attributes`.
+    @field_serializer("members", mode="wrap")
+    def _serialize_members(  # noqa: ANN202
+        self, value: object, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+    ):
+        """Dump each member by its own class. See `serialize_members`."""
+        return serialize_members(value, info)
+
     @model_validator(mode="before")
     @classmethod
     def _copy_members(cls, data: object) -> object:
@@ -2087,7 +2095,7 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
         class's scope, and the fields that a node's class adds are kept.
 
         Raises `ValueError` if the root is an array, if a node's parent is an
-        array, if a key does not start with `/` or ends with `/`, or if a
+        array, if a key does not start with `/` or has an empty segment, or if a
         value is not a Zarr V3 node spec.
 
         Parameters
@@ -2479,15 +2487,15 @@ def _flat_nodes(data: Mapping[str, AnyArraySpec | AnyGroupSpec | AnyBaseGroupSpe
     leading `/`. A `GroupSpec` value's members are left out, because a
     group's members are the entries under its path. Raises `ValueError` if
     the root is an array, if a key other than the root's does not start with
-    `/` or ends with `/`, or if a value is not a Zarr V3 node spec.
+    `/` or has an empty segment, or if a value is not a Zarr V3 node spec.
     """
     nodes: dict[str, tuple[ZarrV3NodeType | None, object]] = {}
     for key, value in data.items():
         if key and not key.startswith("/"):
             msg = f'Invalid path: {key} does not start with "/".'
             raise ValueError(msg)
-        if key.endswith("/"):
-            msg = f'Invalid path: {key} ends with "/", so it names no node.'
+        if key and "" in key[1:].split("/"):
+            msg = f"Invalid path: {key} has an empty segment, so it names no node."
             raise ValueError(msg)
         if isinstance(value, ArraySpec):
             if not key:

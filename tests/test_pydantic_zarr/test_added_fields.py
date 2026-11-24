@@ -9,7 +9,8 @@ read back.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, NotRequired
+from collections.abc import Mapping
+from typing import Literal, NotRequired
 
 import numpy as np
 import pytest
@@ -24,9 +25,6 @@ from zarr_metadata.v3.definition import (
 
 from pydantic_zarr import v2, v3
 from pydantic_zarr._metadata import CORE_CONTEXT
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping
 
 
 class Label(TypedDict):
@@ -243,28 +241,77 @@ def test_added_fields_round_trip(
     assert {key: document for key, document in replaced.items() if "/" in key} == members
 
 
-def test_member_typed_as_a_base_class_keeps_added_fields() -> None:
+class ArrayMembers(TypedDict, closed=True):
+    x: v3.ArraySpec
+
+
+class ArrayMembersV2(TypedDict, closed=True):
+    x: v2.ArraySpec
+
+
+def _tagged_v3() -> TaggedArray:
+    return TaggedArray(**v3.ArraySpec.from_array(np.arange(4)).model_dump(), tag=_label("kept"))
+
+
+def _tagged_v2() -> TaggedArrayV2:
+    return TaggedArrayV2(**v2.ArraySpec.from_array(np.arange(4)).model_dump(), tag="kept", count=1)
+
+
+@pytest.mark.parametrize(
+    ("group_class", "member", "field", "changed"),
+    [
+        (v3.GroupSpec, _tagged_v3(), "tag", _label("changed")),
+        (
+            v3.GroupSpec[dict[str, object], Mapping[str, v3.ArraySpec]],
+            _tagged_v3(),
+            "tag",
+            _label("changed"),
+        ),
+        (v3.GroupSpec[dict[str, object], ArrayMembers], _tagged_v3(), "tag", _label("changed")),
+        (v2.GroupSpec, _tagged_v2(), "tag", "changed"),
+        (v2.GroupSpec[dict[str, object], ArrayMembersV2], _tagged_v2(), "tag", "changed"),
+    ],
+    ids=["v3-plain", "v3-mapping", "v3-typeddict", "v2-plain", "v2-typeddict"],
+)
+def test_member_typed_as_a_base_class_keeps_added_fields(
+    group_class: type[v3.GroupSpec | v2.GroupSpec],
+    member: TaggedArray | TaggedArrayV2,
+    field: str,
+    changed: JSONValue,
+) -> None:
     """
-    A plain `GroupSpec` whose member is a subclass instance dumps the member
-    by its own class. So `replace` keeps the fields the member's class adds,
-    and `from_flat` and `from_stored_metadata_json` read them back as extra
+    A group whose members type is a base class of a member's class dumps the
+    member by its own class. So `model_dump` and `replace` keep the fields
+    the member's class adds, and `diff` reports a change to them.
+    `from_flat` and `from_stored_metadata_json` read them back as extra
     fields of a plain member.
     """
-    array = v3.ArraySpec.from_array(np.arange(4)).model_dump()
-    member = TaggedArray(**array, tag=_label("kept"))
-    group = v3.GroupSpec(members={"x": member})
-    assert group.model_dump()["members"]["x"]["tag"] == _label("kept")
-    replaced = group.replace(attributes={"a": 1})
+    group = group_class(members={"x": member})
+    added = {
+        name: getattr(member, name)
+        for name in ("tag", "shape_label", "count")
+        if hasattr(member, name)
+    }
+    assert {name: group.model_dump()["members"]["x"][name] for name in added} == added
     stored = group.to_stored_metadata_json()
-    assert replaced.to_stored_metadata_json()["x/zarr.json"] == stored["x/zarr.json"]
-    for read in (
-        v3.GroupSpec.from_stored_metadata_json(stored),
-        v3.GroupSpec.from_flat(group.to_flat()),
-    ):
-        assert read.members["x"].extra_fields == {
-            "tag": _label("kept"),
-            "shape_label": _label("1d"),
-        }
+    replaced = group.replace(attributes={"a": 1}).to_stored_metadata_json()
+    assert {key: doc for key, doc in replaced.items() if "/" in key} == {
+        key: doc for key, doc in stored.items() if "/" in key
+    }
+    other = group_class(members={"x": member.model_copy(update={field: changed})})
+    if isinstance(group, v3.GroupSpec) and isinstance(other, v3.GroupSpec):
+        patch = group.diff(other)
+        read_flat = v3.GroupSpec.from_flat(group.to_flat())
+    elif isinstance(group, v2.GroupSpec) and isinstance(other, v2.GroupSpec):
+        patch = group.diff(other)
+        read_flat = v2.GroupSpec.from_flat(group.to_flat())
+    else:
+        pytest.fail("the group and its copy are of different Zarr versions")
+    assert patch[0]["path"].startswith(f"/members/x/{field}")
+    for read in (group_class.from_stored_metadata_json(stored), read_flat):
+        read_member = read.members["x"]
+        assert isinstance(read_member, v3.ArraySpec | v2.ArraySpec)
+        assert {name: read_member.extra_fields[name] for name in added} == added
 
 
 def test_flat_groups_hold_added_fields_as_extra_fields() -> None:
@@ -374,3 +421,34 @@ def test_v2_group_added_field(spec_class: type) -> None:
 
     with pytest.raises(ValidationError, match=r"Fields that this class adds: \['label'\]"):
         Labeled()
+
+
+def test_v3_computed_field_not_an_object() -> None:
+    """A V3 computed field is written to the document, so it must be a valid extra field too."""
+
+    class Computed(v3.GroupSpec):
+        @computed_field
+        @property
+        def label(self) -> str:
+            return "none"
+
+    with pytest.raises(ValidationError, match="label: a field this class adds"):
+        Computed()
+
+
+def test_extra_field_named_after_an_alias() -> None:
+    """An extra field may not use a field's alias as its key, because the field dumps under it."""
+    with pytest.raises(ValidationError, match=r"\['the-alias'\] name fields of this spec"):
+        Mid.model_validate(
+            {
+                **_v3_hierarchy().members["changed"].model_dump(),
+                "extra_fields": {"the-alias": DEFAULT_LABEL},
+            }
+        )
+
+
+def test_extra_field_named_after_a_computed_field() -> None:
+    """An extra field may not use a computed field's name as its key, because the field dumps under it."""
+    array = v3.ArraySpec.from_array(np.arange(4)).model_dump()
+    with pytest.raises(ValidationError, match=r"\['shape_label'\] name fields of this spec"):
+        TaggedArray(**array, extra_fields={"shape_label": DEFAULT_LABEL})

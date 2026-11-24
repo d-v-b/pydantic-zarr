@@ -21,8 +21,11 @@ import numpy.typing as npt
 from pydantic import (
     BaseModel,
     Field,
+    SerializationInfo,
     SerializeAsAny,
+    SerializerFunctionWrapHandler,
     TypeAdapter,
+    field_serializer,
     field_validator,
     model_validator,
 )
@@ -77,6 +80,7 @@ from pydantic_zarr.core import (
     parse_dtype_v2,
     read_attribute,
     resolve_member_path,
+    serialize_members,
     split_store_key,
     stored_array,
     stored_root,
@@ -92,9 +96,8 @@ if TYPE_CHECKING:
 # serialize through the empty base schema. See the note on TBaseAttr in v3.
 type TBaseAttr = Mapping[str, object] | SerializeAsAny[BaseModel]
 # TBaseMembers is the widest members mapping. It is both the bound and the
-# default of TMembers. See the notes on these types in v3. As there, the union
-# is SerializeAsAny so that a member is dumped by its own class.
-type TBaseItem = SerializeAsAny[Union["GroupSpec", "ArraySpec"]]
+# default of TMembers. See the notes on these types in v3.
+type TBaseItem = Union["GroupSpec", "ArraySpec"]
 type TBaseMembers = Mapping[str, TBaseItem]
 
 # Aliases for specs of any specialization. They are ordinary wide types, equal
@@ -934,6 +937,14 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
     # unparameterized GroupSpec() then gets the default members type.
     members: TMembers = Field(default=cast("TMembers", {}), validate_default=True)
 
+    # No return annotation, as on `StrictBase._serialize_attributes`.
+    @field_serializer("members", mode="wrap")
+    def _serialize_members(  # noqa: ANN202
+        self, value: object, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+    ):
+        """Dump each member by its own class. See `serialize_members`."""
+        return serialize_members(value, info)
+
     @model_validator(mode="before")
     @classmethod
     def _copy_members(cls, data: object) -> object:
@@ -1201,8 +1212,9 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
         `data` is a mapping from store key to parsed JSON document, in the
         form that `to_stored_metadata_json` returns. Each node's documents are
         read, and a missing `.zattrs` is treated as empty attributes. Each
-        array's documents are validated as an `ArraySpec`, because a Zarr V2
-        document does not say whether it is an array. Then the nodes'
+        node's documents are validated as an `ArraySpec` or a `BaseGroupSpec`,
+        as its store keys say. The nested document cannot say it, because a
+        Zarr V2 document does not state its node type. Then the nodes'
         documents are assembled into one nested document, and this class
         validates it. So each member is validated by its own class, and the
         fields that a member's class adds are read back. Stored metadata cannot
@@ -1225,12 +1237,12 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
         nodes = _stored_nodes(data)
         stored_root(nodes, "group")
         # A Zarr V2 document does not state its node type, so an invalid
-        # array document could validate as a group. So each array's documents
-        # are validated as an array first. Zarr V2 has no validation scopes,
-        # so a plain `ArraySpec` accepts every valid array.
+        # array document could validate as a group, and a group document as
+        # an array. So each node's documents are validated as its type first.
+        # Zarr V2 has no validation scopes, so a plain `ArraySpec` or
+        # `BaseGroupSpec` accepts every valid node of its type.
         for node_type, document in nodes.values():
-            if node_type == "array":
-                ArraySpec.model_validate(document)
+            (ArraySpec if node_type == "array" else BaseGroupSpec).model_validate(document)
         return cls.model_validate(nested_document(nodes))
 
     @classmethod
@@ -1249,7 +1261,7 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
         validated by its own class, and the fields that an array's class adds are kept.
 
         Raises `ValueError` if the root is an array, if a node's parent is an array, if a key
-        does not start with `/` or ends with `/`, or if a value is not a Zarr V2 node spec.
+        does not start with `/` or has an empty segment, or if a value is not a Zarr V2 node spec.
 
         Parameters
         ----------
@@ -1556,15 +1568,15 @@ def _flat_nodes(data: Mapping[str, AnyArraySpec | AnyGroupSpec | AnyBaseGroupSpe
     leading `/`. A `GroupSpec` value's members are left out, because a
     group's members are the entries under its path. Raises `ValueError` if
     the root is an array, if a key other than the root's does not start with
-    `/` or ends with `/`, or if a value is not a Zarr V2 node spec.
+    `/` or has an empty segment, or if a value is not a Zarr V2 node spec.
     """
     nodes: dict[str, tuple[StoredNodeType | None, object]] = {}
     for key, value in data.items():
         if key and not key.startswith("/"):
             msg = f'Invalid path: {key} does not start with "/".'
             raise ValueError(msg)
-        if key.endswith("/"):
-            msg = f'Invalid path: {key} ends with "/", so it names no node.'
+        if key and "" in key[1:].split("/"):
+            msg = f"Invalid path: {key} has an empty segment, so it names no node."
             raise ValueError(msg)
         if isinstance(value, ArraySpec):
             if not key:

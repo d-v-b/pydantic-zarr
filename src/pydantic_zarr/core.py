@@ -41,6 +41,7 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
+from pydantic_core import SchemaSerializer, core_schema
 
 # pydantic resolves the `extra_fields` annotation at runtime
 from zarr_metadata import JSONValue  # noqa: TC002
@@ -65,7 +66,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from pydantic.json_schema import JsonSchemaValue
-    from pydantic_core import CoreSchema, SchemaSerializer
+    from pydantic_core import CoreSchema
 
 # The selection that pydantic's `model_dump` accepts as `include` or `exclude`
 # (`pydantic.main.IncEx`), plus `None` for "no selection".
@@ -153,6 +154,42 @@ def serialize_attributes(
         value,
         mode=info.mode,
         by_alias=True,
+        include=cast("IncEx", info.include),
+        exclude=cast("IncEx", info.exclude),
+        context=info.context,
+        exclude_unset=info.exclude_unset,
+        exclude_defaults=info.exclude_defaults,
+        exclude_none=info.exclude_none,
+        exclude_computed_fields=info.exclude_computed_fields,
+        round_trip=info.round_trip,
+        serialize_as_any=info.serialize_as_any,
+    )
+
+
+_RUNTIME_TYPE_SERIALIZER = SchemaSerializer(core_schema.any_schema())
+"""
+A serializer that dumps each value by its runtime type, as `SerializeAsAny`
+does: a model by its own class, a mapping by its items.
+"""
+
+
+def serialize_members(value: object, info: SerializationInfo) -> object:
+    """
+    Serialize the members of a group, each by its own class.
+
+    Through the members annotation, a member whose class is a subclass of the
+    annotated class would be dumped as the annotated class, so the fields that
+    its class adds would be left out. They are part of the member's metadata
+    document (see `added_fields`), so a group's dump would lose them, and so
+    would `replace` and `diff`. The dump's settings carry over, including the
+    part of `include` and `exclude` that selects within the members.
+    """
+    # The casts bridge the same gap in pydantic-core's stubs as in
+    # `serialize_attributes`.
+    return _RUNTIME_TYPE_SERIALIZER.to_python(
+        value,
+        mode=info.mode,
+        by_alias=info.by_alias,
         include=cast("IncEx", info.include),
         exclude=cast("IncEx", info.exclude),
         context=info.context,
@@ -1486,15 +1523,24 @@ def nested_document(
     validated by its own class, in its own scope. A document that is not a
     JSON object is passed on as it is, so validation rejects it.
 
-    Raises `ValueError` if a node's parent is an array, or if a node's parent
-    is not in `nodes` and `implicit_group` is `None`. With `implicit_group`,
-    a missing parent, the root included, is created with that document.
+    Raises `ValueError` if a group's document has a `members` key, because
+    a group's metadata does not hold its members. Raises `ValueError` if a
+    node's parent is an array, or if a node's parent is not in `nodes` and
+    `implicit_group` is `None`. With `implicit_group`, a missing parent, the
+    root included, is created with that document.
     """
     members_by_group: dict[str, dict[str, object]] = {}
     documents: dict[str, object] = {}
 
     def add(path: str, node_type: StoredNodeType | None, document: object) -> None:
         if node_type != "array" and isinstance(document, Mapping):
+            if "members" in document:
+                where = repr(path) if path else "the root"
+                msg = (
+                    f"The group document at {where} has a 'members' key, but a group's "
+                    "metadata does not hold its members."
+                )
+                raise ValueError(msg)
             members: dict[str, object] = {}
             document = {**document, "members": members}
             members_by_group[path] = members

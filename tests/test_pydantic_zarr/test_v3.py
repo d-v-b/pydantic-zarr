@@ -358,10 +358,23 @@ def test_from_flat_node_under_array() -> None:
         GroupSpec.from_flat({"/a": array, "/a/b": array})
 
 
-def test_from_flat_key_ends_with_slash() -> None:
-    """A flat hierarchy key that ends with `/` names no node, so it is refused."""
-    with pytest.raises(ValueError, match='Invalid path: / ends with "/"'):
-        GroupSpec.from_flat({"/": GroupSpec()})
+def test_from_flat_key_without_leading_slash() -> None:
+    """A flat hierarchy key other than the root's must start with `/`."""
+    with pytest.raises(ValueError, match='Invalid path: a/b does not start with "/"'):
+        GroupSpec.from_flat({"a/b": GroupSpec()})
+
+
+def test_from_flat_array_at_root() -> None:
+    """A `GroupSpec` cannot be read from a flat hierarchy whose root is an array."""
+    with pytest.raises(ValueError, match="Got an ArraySpec as the root node"):
+        GroupSpec.from_flat({"": ArraySpec.from_array(np.ones(1))})
+
+
+@pytest.mark.parametrize("key", ["/", "//b", "/a//b", "/a/"])
+def test_from_flat_key_with_empty_segment(key: str) -> None:
+    """A flat hierarchy key with an empty segment names no node, so it is refused."""
+    with pytest.raises(ValueError, match=f"Invalid path: {key} has an empty segment"):
+        GroupSpec.from_flat({key: GroupSpec()})
 
 
 def test_mix_v3_v2_fails() -> None:
@@ -2554,6 +2567,18 @@ def test_from_stored_metadata_json_array_with_members() -> None:
     stored = {**_TO_METADATA_JSON_ARRAY.to_stored_metadata_json(), "g/zarr.json": {}}
     with pytest.raises(ValueError, match="An array has no members"):
         ArraySpec.from_stored_metadata_json(stored)
+
+
+@pytest.mark.parametrize("key", ["zarr.json", "g/zarr.json"])
+def test_from_stored_metadata_json_group_document_with_members(key: str) -> None:
+    """A group document with a `members` key is refused: a group's metadata does not hold its members."""
+    stored: dict[str, object] = {
+        "zarr.json": GroupSpec().to_metadata_json(),
+        "g/zarr.json": GroupSpec().to_metadata_json(),
+    }
+    stored[key] = {**GroupSpec().to_metadata_json(), "members": {"must_understand": False}}
+    with pytest.raises(ValueError, match="has a 'members' key"):
+        GroupSpec.from_stored_metadata_json(stored)
 
 
 @pytest.mark.parametrize("parent", ["missing", "array"])

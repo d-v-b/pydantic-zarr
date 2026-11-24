@@ -633,10 +633,23 @@ def test_from_flat_node_under_array() -> None:
         GroupSpec.from_flat({"/a": array, "/a/b": array})
 
 
-def test_from_flat_key_ends_with_slash() -> None:
-    """A flat hierarchy key that ends with `/` names no node, so it is refused."""
-    with pytest.raises(ValueError, match='Invalid path: / ends with "/"'):
-        GroupSpec.from_flat({"/": GroupSpec()})
+def test_from_flat_key_without_leading_slash() -> None:
+    """A flat hierarchy key other than the root's must start with `/`."""
+    with pytest.raises(ValueError, match='Invalid path: a/b does not start with "/"'):
+        GroupSpec.from_flat({"a/b": GroupSpec()})
+
+
+def test_from_flat_array_at_root() -> None:
+    """A `GroupSpec` cannot be read from a flat hierarchy whose root is an array."""
+    with pytest.raises(ValueError, match="Got an ArraySpec as the root node"):
+        GroupSpec.from_flat({"": ArraySpec.from_array(np.ones(1))})
+
+
+@pytest.mark.parametrize("key", ["/", "//b", "/a//b", "/a/"])
+def test_from_flat_key_with_empty_segment(key: str) -> None:
+    """A flat hierarchy key with an empty segment names no node, so it is refused."""
+    with pytest.raises(ValueError, match=f"Invalid path: {key} has an empty segment"):
+        GroupSpec.from_flat({key: GroupSpec()})
 
 
 def test_mix_v3_v2_fails() -> None:
@@ -1281,8 +1294,20 @@ def test_from_stored_metadata_json_v2_malformed_key(key: str) -> None:
         {"x/.zarray": []},
         {"x/.zgroup": {"zarr_format": 2}, "x/.zattrs": []},
         {"x/.zarray": {"zarr_format": 2}},
+        {
+            "x/.zgroup": ArraySpec(shape=(1,), chunks=(1,), dtype="|u1").to_stored_metadata_json()[
+                ".zarray"
+            ]
+        },
+        {"x/.zgroup": {"zarr_format": 2, "members": {}}},
     ],
-    ids=["zarray-not-object", "zattrs-not-object", "zarray-invalid"],
+    ids=[
+        "zarray-not-object",
+        "zattrs-not-object",
+        "zarray-invalid",
+        "zgroup-holds-an-array",
+        "zgroup-holds-members",
+    ],
 )
 def test_from_stored_metadata_json_v2_invalid_document(member: dict[str, object]) -> None:
     """A node whose documents are not a valid node is refused by validation."""

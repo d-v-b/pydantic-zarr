@@ -526,8 +526,9 @@ refuse them.
 
 The same goes for a field that a subclass adds, because it is written as a key
 of the node's document. An `ArraySpec` subclass can add a field, and a plain
-`ArraySpec` holds it in `extra_fields`, so it is kept when a hierarchy is
-written and read back. A group subclass cannot add a field, unless the field
+`ArraySpec` holds it in `extra_fields`, so `to_stored_metadata_json` and
+`from_stored_metadata_json` keep it. `zarr-python` drops it, as it drops every
+extra key. A group subclass cannot add a field, unless the field
 is declared with `Field(exclude=True)`, which keeps it out of the document.
 
 ```python
