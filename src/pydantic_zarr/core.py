@@ -11,6 +11,7 @@ from typing import (
     Annotated,
     Final,
     Literal,
+    NoReturn,
     Protocol,
     Self,
     TypedDict,
@@ -40,6 +41,7 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
+from pydantic_core import SchemaSerializer, core_schema
 
 # pydantic resolves the `extra_fields` annotation at runtime
 from zarr_metadata import JSONValue  # noqa: TC002
@@ -64,7 +66,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from pydantic.json_schema import JsonSchemaValue
-    from pydantic_core import CoreSchema, SchemaSerializer
+    from pydantic_core import CoreSchema
 
 # The selection that pydantic's `model_dump` accepts as `include` or `exclude`
 # (`pydantic.main.IncEx`), plus `None` for "no selection".
@@ -164,6 +166,42 @@ def serialize_attributes(
     )
 
 
+_RUNTIME_TYPE_SERIALIZER = SchemaSerializer(core_schema.any_schema())
+"""
+A serializer that dumps each value by its runtime type, as `SerializeAsAny`
+does: a model by its own class, a mapping by its items.
+"""
+
+
+def serialize_members(value: object, info: SerializationInfo) -> object:
+    """
+    Serialize the members of a group, each by its own class.
+
+    Through the members annotation, a member whose class is a subclass of the
+    annotated class would be dumped as the annotated class, so the fields that
+    its class adds would be left out. They are part of the member's metadata
+    document (see `added_fields`), so a group's dump would lose them, and so
+    would `replace` and `diff`. The dump's settings carry over, including the
+    part of `include` and `exclude` that selects within the members.
+    """
+    # The casts bridge the same gap in pydantic-core's stubs as in
+    # `serialize_attributes`.
+    return _RUNTIME_TYPE_SERIALIZER.to_python(
+        value,
+        mode=info.mode,
+        by_alias=info.by_alias,
+        include=cast("IncEx", info.include),
+        exclude=cast("IncEx", info.exclude),
+        context=info.context,
+        exclude_unset=info.exclude_unset,
+        exclude_defaults=info.exclude_defaults,
+        exclude_none=info.exclude_none,
+        exclude_computed_fields=info.exclude_computed_fields,
+        round_trip=info.round_trip,
+        serialize_as_any=info.serialize_as_any,
+    )
+
+
 class StrictBase(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -179,6 +217,37 @@ class StrictBase(BaseModel):
 
 EXTRA_FIELDS = "extra_fields"
 """The name of the field where `ExtraFieldsBase` stores a document's extra fields."""
+
+
+@cache
+def added_field_names(
+    spec_class: type[BaseModel], library_class: type[BaseModel]
+) -> frozenset[str]:
+    """
+    Return the fields of `spec_class`, computed fields included, that
+    `library_class` does not declare. Cached per pair.
+    """
+    names = frozenset(spec_class.model_fields) | frozenset(spec_class.model_computed_fields)
+    library = frozenset(library_class.model_fields) | frozenset(library_class.model_computed_fields)
+    return names - library
+
+
+def added_fields(spec: BaseModel, library_class: type[BaseModel]) -> dict[str, object]:
+    """
+    Return the fields that the class of `spec` adds to `library_class`, as
+    they are written in the metadata document.
+
+    `library_class` is the pydantic-zarr class that the class of `spec`
+    builds on, such as `ArraySpec`. The values are dumped as `model_dump`
+    dumps them, with JSON arrays as tuples, as in `extra_fields`. So a key is
+    a field's alias if the class dumps by alias, and computed fields are
+    included. A field declared with `exclude=True` is not dumped, so it is
+    not part of the document and is left out.
+    """
+    names = added_field_names(type(spec), library_class)
+    if not names:
+        return {}
+    return {key: tuplify_json(value) for key, value in spec.model_dump(include=set(names)).items()}
 
 
 def flatten_extra_fields(document: dict[str, object]) -> dict[str, object]:
@@ -230,13 +299,20 @@ class ExtraFieldsBase(StrictBase):
         declare into `extra_fields`.
 
         They are merged with any entries passed in `extra_fields` directly. A
-        key passed both ways raises `ValueError`.
+        key passed both ways raises `ValueError`. A field's name and its
+        aliases are declared keys. A computed field's key is dropped: the
+        class computes that value again, and a dump writes it.
         """
         if not isinstance(data, Mapping):
             return data
-        declared = cls.model_fields
-        extra = {key: value for key, value in data.items() if key not in declared}
+        declared = frozenset(cls.model_fields) | _declared_keys(cls)
+        computed = cls.model_computed_fields
+        extra = {
+            key: value for key, value in data.items() if key not in declared and key not in computed
+        }
         if not extra:
+            if any(key in computed for key in data):
+                return {key: value for key, value in data.items() if key not in computed}
             return data
         given = data.get(EXTRA_FIELDS, {})
         if not isinstance(given, Mapping):
@@ -254,8 +330,12 @@ class ExtraFieldsBase(StrictBase):
     @field_validator(EXTRA_FIELDS, mode="after")
     @classmethod
     def _refuse_declared_keys(cls, value: Mapping[str, JSONValue]) -> Mapping[str, JSONValue]:
-        """Reject an extra field whose name is a field that this class declares."""
-        declared = sorted(set(value) & set(cls.model_fields))
+        """
+        Reject an extra field whose key is a field that this class declares:
+        a field's name or alias, or a computed field's name.
+        """
+        keys = set(cls.model_fields) | _declared_keys(cls) | set(cls.model_computed_fields)
+        declared = sorted(set(value) & keys)
         if declared:
             msg = f"{declared} name fields of this spec, so they are not extra fields"
             raise ValueError(msg)
@@ -1429,37 +1509,72 @@ def stored_array(nodes: StoredNodes) -> object:
     return document
 
 
-def stored_flat[A: BaseModel, G: BaseModel](
-    nodes: StoredNodes, array_class: type[A], group_class: type[G]
-) -> dict[str, A | G]:
+def nested_document(
+    nodes: StoredNodes, *, implicit_group: Mapping[str, object] | None = None
+) -> object:
     """
-    Return the hierarchy that `nodes` describe, in the form `from_flat` accepts.
+    Assemble the documents of `nodes` into the document of one hierarchy.
 
-    A node whose type is `"array"` is validated as an `array_class`. Any other
-    node, including one whose type is not stated, is validated as a
-    `group_class`. Each node is keyed by its path in the form `to_flat` uses.
-    That is the key prefix with a leading `/` (`"/a/b"`, the V3 hierarchy
-    path), except that the root's path is `""`, not `/`.
+    `nodes` is keyed by key prefix: `""` for the root, and `"a/b"` for the
+    node at `/a/b`. A node whose type is `"array"` is an array. Any other
+    node is a group, and its document gains a `members` object, which holds
+    the documents of its children by name. The result is the root's
+    document. A `GroupSpec` class validates it as a whole, so each member is
+    validated by its own class, in its own scope. A document that is not a
+    JSON object is passed on as it is, so validation rejects it.
 
-    Raises `ValueError` if `nodes` contain no group at the root, or contain a
-    node whose parent is not a group in `nodes` (a store has no implicit
-    groups). Raises `ValidationError` if a node's document is not valid.
+    Raises `ValueError` if a group's document has a `members` key, because
+    that key would clash with the `members` field of a `GroupSpec`. The Zarr
+    V3 spec permits such a key as an extra field that a reader recognizes or
+    that says ``"must_understand": false``, but a `GroupSpec` cannot hold it. Raises `ValueError` if a
+    node's parent is an array, or if a node's parent is not in `nodes` and
+    `implicit_group` is `None`. With `implicit_group`, a missing parent, the
+    root included, is created with that document.
     """
-    stored_root(nodes, "group")
-    flat: dict[str, A | G] = {
-        f"/{path}" if path else "": (
-            array_class if node_type == "array" else group_class
-        ).model_validate(document)
-        for path, (node_type, document) in nodes.items()
-    }
-    for path in nodes:
-        if path:
-            parent = path.rpartition("/")[0]
-            if not isinstance(flat.get(f"/{parent}" if parent else ""), group_class):
-                where = repr(parent) if parent else "the root"
+    members_by_group: dict[str, dict[str, object]] = {}
+    documents: dict[str, object] = {}
+
+    def add(path: str, node_type: StoredNodeType | None, document: object) -> None:
+        if node_type != "array" and isinstance(document, Mapping):
+            if "members" in document:
+                where = repr(path) if path else "the root"
                 msg = (
-                    f"The layout holds documents at {path!r}, but no group's at {where}, "
-                    "its parent."
+                    f"The group document at {where} has a 'members' key. A GroupSpec "
+                    "holds a group's members in its 'members' field, so it cannot read "
+                    "that key as part of the group's metadata."
                 )
                 raise ValueError(msg)
-    return flat
+            members: dict[str, object] = {}
+            document = {**document, "members": members}
+            members_by_group[path] = members
+        documents[path] = document
+        if not path:
+            return
+        parent, _, name = path.rpartition("/")
+        if parent not in documents:
+            if implicit_group is None:
+                _refuse_parent(path, parent)
+            add(parent, "group", dict(implicit_group))
+        if parent in members_by_group:
+            members_by_group[parent][name] = document
+        elif nodes[parent][0] == "array":
+            _refuse_parent(path, parent)
+        # Otherwise the parent's document is not a JSON object, and its
+        # validation fails.
+
+    # Parents come before their children: the root first, then by depth.
+    for path in sorted(nodes, key=lambda path: path.count("/") if path else -1):
+        add(path, *nodes[path])
+    if "" not in documents:
+        if implicit_group is None:
+            msg = "The layout holds no group's metadata at the root."
+            raise ValueError(msg)
+        add("", "group", dict(implicit_group))
+    return documents[""]
+
+
+def _refuse_parent(path: str, parent: str) -> NoReturn:
+    """Raise `ValueError`: the node at `path` has no group at `parent` as its parent."""
+    where = repr(parent) if parent else "the root"
+    msg = f"The layout holds documents at {path!r}, but no group's at {where}, its parent."
+    raise ValueError(msg)

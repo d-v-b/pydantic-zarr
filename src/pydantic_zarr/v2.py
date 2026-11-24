@@ -21,8 +21,11 @@ import numpy.typing as npt
 from pydantic import (
     BaseModel,
     Field,
+    SerializationInfo,
     SerializeAsAny,
+    SerializerFunctionWrapHandler,
     TypeAdapter,
+    field_serializer,
     field_validator,
     model_validator,
 )
@@ -63,6 +66,7 @@ from pydantic_zarr.core import (
     StoredNodes,
     StoredNodeType,
     StrictBase,
+    added_fields,
     as_dtype_like,
     as_shape,
     canonicalize_fill_value,
@@ -71,13 +75,14 @@ from pydantic_zarr.core import (
     ensure_members_mapping,
     guess_chunks,
     model_like,
+    nested_document,
     node_patch,
     parse_dtype_v2,
     read_attribute,
     resolve_member_path,
+    serialize_members,
     split_store_key,
     stored_array,
-    stored_flat,
     stored_root,
     tuplify_json,
 )
@@ -330,6 +335,13 @@ class ArraySpec(NodeSpec, ExtraFieldsBase, Generic[TAttr]):
         keys. zarr-python drops them when it reads or writes an array. Group
         metadata accepts no extra fields, because the spec says "Other keys
         MUST NOT be present".
+
+    A field that a subclass adds is written as a key of the `.zarray`
+    document too, so it is an extra field of the document. A plain
+    `ArraySpec` holds it in its `extra_fields`, so the field is kept when a
+    hierarchy is written and read back. A field declared with
+    ``Field(exclude=True)`` is not dumped, so it is not part of the document,
+    and it is not kept.
     """
 
     attributes: TAttr = Field(default={}, validate_default=True)
@@ -690,6 +702,27 @@ class _GroupNode(NodeSpec, Generic[TAttr]):
 
     attributes: TAttr = Field(default={}, validate_default=True)
 
+    @model_validator(mode="after")
+    def validate_metadata_document(self) -> Self:
+        """
+        Reject fields that a subclass adds to the group's metadata document.
+
+        A field that a subclass adds would be a key of the `.zgroup`
+        document. The Zarr V2 spec allows only `zarr_format` there, and says
+        "Other keys MUST NOT be present". So such a field cannot be written.
+        A field declared with ``Field(exclude=True)`` is not dumped, so it is
+        not part of the document, and it is allowed.
+        """
+        added = sorted(added_fields(self, _library_class(type(self))))
+        if added:
+            msg = (
+                f"Fields that this class adds: {added}. A Zarr V2 group's .zgroup document "
+                "may hold only zarr_format, so these fields cannot be stored. To keep a "
+                "field out of the metadata document, declare it with Field(exclude=True)."
+            )
+            raise ValueError(msg)
+        return self
+
     def _own_metadata(self) -> AnyBaseGroupSpec:
         """
         Return this group's own metadata as a `BaseGroupSpec`.
@@ -904,6 +937,14 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
     # unparameterized GroupSpec() then gets the default members type.
     members: TMembers = Field(default=cast("TMembers", {}), validate_default=True)
 
+    # No return annotation, as on `StrictBase._serialize_attributes`.
+    @field_serializer("members", mode="wrap")
+    def _serialize_members(  # noqa: ANN202
+        self, value: object, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+    ):
+        """Dump each member by its own class. See `serialize_members`."""
+        return serialize_members(value, info)
+
     @model_validator(mode="before")
     @classmethod
     def _copy_members(cls, data: object) -> object:
@@ -947,10 +988,10 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
 
         The result is not validated again, because this spec is already
         valid. It is a plain `BaseGroupSpec`, whatever this spec's class is.
-        So it is typed with the widest attributes type, and a field that a
-        subclass of `GroupSpec` adds is left out. To read it as a
-        subclass of `BaseGroupSpec`, validate its `model_dump()` with that
-        class. Its attributes are a deep copy, so changing them does not
+        So it is typed with the widest attributes type. A field that a
+        subclass declares with ``Field(exclude=True)`` is left out. To read
+        it as a subclass of `BaseGroupSpec`, validate its `model_dump()` with
+        that class. Its attributes are a deep copy, so changing them does not
         change this spec.
         """
         return copy.deepcopy(self._own_metadata())
@@ -1170,8 +1211,13 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
 
         `data` is a mapping from store key to parsed JSON document, in the
         form that `to_stored_metadata_json` returns. Each node's documents are
-        read, and a missing `.zattrs` is treated as empty attributes. The
-        nodes are then assembled with `from_flat`. Stored metadata cannot
+        read, and a missing `.zattrs` is treated as empty attributes. Each
+        node's documents are validated as an `ArraySpec` or a `BaseGroupSpec`,
+        as its store keys say. The nested document cannot say it, because a
+        Zarr V2 document does not state its node type. Then the nodes'
+        documents are assembled into one nested document, and this class
+        validates it. So each member is validated by its own class, and the
+        fields that a member's class adds are read back. Stored metadata cannot
         distinguish a group whose members were not read from a group with no
         members. So every group is read as a `GroupSpec`, with the members
         found in `data`.
@@ -1188,7 +1234,16 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
 
         Raises `ValidationError` if a node's documents are not valid.
         """
-        return cls.from_flat(stored_flat(_stored_nodes(data), ArraySpec, BaseGroupSpec))
+        nodes = _stored_nodes(data)
+        stored_root(nodes, "group")
+        # A Zarr V2 document does not state its node type, so an invalid
+        # array document could validate as a group, and a group document as
+        # an array. So each node's documents are validated as its type first.
+        # Zarr V2 has no validation scopes, so a plain `ArraySpec` or
+        # `BaseGroupSpec` accepts every valid node of its type.
+        for node_type, document in nodes.values():
+            (ArraySpec if node_type == "array" else BaseGroupSpec).model_validate(document)
+        return cls.model_validate(nested_document(nodes))
 
     @classmethod
     def from_flat(cls, data: Mapping[str, AnyArraySpec | AnyGroupSpec | AnyBaseGroupSpec]) -> Self:
@@ -1198,7 +1253,15 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
         The flat hierarchy is a `dict`. Its keys must be valid paths. Its values must be
         `ArraySpec` or `BaseGroupSpec` instances, as `to_flat` returns them. For a `GroupSpec`
         value, only its own metadata is used. Its members are ignored, because a group's members
-        are the entries under its path.
+        are the entries under its path. A group that `data` leaves out is created with no
+        attributes.
+
+        Each node's metadata document is taken from `to_metadata_json`. The documents are
+        assembled into one nested document, and this class validates it. So each member is
+        validated by its own class, and the fields that an array's class adds are kept.
+
+        Raises `ValueError` if the root is an array, if a node's parent is an array, if a key
+        does not start with `/` or has an empty segment, or if a value is not a Zarr V2 node spec.
 
         Parameters
         ----------
@@ -1223,8 +1286,26 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
         >>> GroupSpec.from_flat(flat)
         GroupSpec(zarr_format=2, attributes={'foo': 10}, members={'a': ArraySpec(zarr_format=2, attributes={}, shape=(10,), chunks=(10,), dtype='<i8', fill_value=0, order='C', filters=None, dimension_separator='/', compressor=None)})
         """
-        from_flated = from_flat_group(data)
-        return cls.model_validate(from_flated.model_dump())
+        return cls.model_validate(
+            nested_document(_flat_nodes(data), implicit_group=_IMPLICIT_GROUP)
+        )
+
+
+def _library_class(spec_class: type[NodeSpec]) -> type[NodeSpec]:
+    """
+    Return the pydantic-zarr class whose fields `spec_class` does not add:
+    `ArraySpec` for an array, and `GroupSpec` for a group.
+
+    The fields of `spec_class` that this class does not declare are the
+    fields that `spec_class` adds to its metadata document.
+    """
+    if issubclass(spec_class, ArraySpec):
+        return ArraySpec
+    # A group's document leaves out `members`, so for a `BaseGroupSpec`
+    # subclass, a field named `members` is not added to the document either.
+    if issubclass(spec_class, GroupSpec | BaseGroupSpec):
+        return GroupSpec
+    return NodeSpec
 
 
 def _read_array_document(document: Mapping[str, object]) -> object:
@@ -1356,8 +1437,8 @@ def to_flat(
     joining `root_path` and the member's name with a `/` character. This repeats recursively for
     each sub-member. The entries are sorted by key length.
 
-    A field that a subclass of `GroupSpec` or `BaseGroupSpec` adds is not
-    part of a plain `BaseGroupSpec`, so it is left out of the group's entry.
+    A group's entry holds only its attributes, because a Zarr V2 group's
+    metadata holds nothing else. An array is copied as it is, with its class.
 
     Parameters
     ----------
@@ -1450,6 +1531,10 @@ def from_flat_group(
     Generate a `GroupSpec` from a flat representation of a hierarchy, i.e. a `dict` with
     string keys (paths) and `ArraySpec` / `GroupSpec` values (nodes).
 
+    This is `GroupSpec.from_flat(data)`. The result is a plain `GroupSpec`,
+    and its members are plain specs. A field that an array's class adds is
+    one of that member's `extra_fields`.
+
     Parameters
     ----------
     data : Dict[str, ArraySpec | GroupSpec]
@@ -1468,62 +1553,42 @@ def from_flat_group(
     >>> from_flat_group(tree) # note that an implicit Group is created
     GroupSpec(zarr_format=2, attributes={}, members={'foo': ArraySpec(zarr_format=2, attributes={}, shape=(10,), chunks=(10,), dtype='<i8', fill_value=0, order='C', filters=None, dimension_separator='/', compressor=None)})
     """
-    root_name = ""
-    sep = "/"
-    # arrays that will be members of the returned GroupSpec
-    member_arrays: dict[str, AnyArraySpec] = {}
-    # groups, and their members, that will be members of the returned GroupSpec.
-    # this dict is populated by recursively applying `from_flat_group` function.
-    member_groups: dict[str, AnyGroupSpec] = {}
-    # this dict collects the arrayspecs and groupspecs that belong to one of the members of the
-    # groupspecs we are constructing. They will later be aggregated in a recursive step that
-    # populates member_groups
-    submember_by_parent_name: dict[
-        str, dict[str, AnyArraySpec | AnyGroupSpec | AnyBaseGroupSpec]
-    ] = {}
-    # copy the input to ensure that mutations are contained inside this function
-    data_copy = dict(data)
-    # Get the root node
-    try:
-        # The root node is a GroupSpec with the key ""
-        root_node = data_copy.pop(root_name)
-        if isinstance(root_node, ArraySpec):
-            raise ValueError("Got an ArraySpec as the root node. This is invalid.")  # noqa: TRY004
-    except KeyError:
-        # If a root node was not found, create a default one
-        root_node = BaseGroupSpec(attributes={})
+    return GroupSpec.from_flat(data)
 
-    # partition the tree (sans root node) into 2 categories: (arrays, groups + their members).
-    for key, value in data_copy.items():
-        key_parts = key.split(sep)
-        if key_parts[0] != root_name:
-            raise ValueError(f'Invalid path: {key} does not start with "{root_name}{sep}".')
 
-        subparent_name = key_parts[1]
-        if len(key_parts) == 2:
-            # this is an array or group that belongs to the group we are ultimately returning
-            if isinstance(value, ArraySpec):
-                member_arrays[subparent_name] = value
-            elif isinstance(value, BaseGroupSpec | GroupSpec):
-                if subparent_name not in submember_by_parent_name:
-                    submember_by_parent_name[subparent_name] = {}
-                submember_by_parent_name[subparent_name][root_name] = value
-            else:
-                raise ValueError(
-                    f"Value at '{key}' is not a v2 ArraySpec or GroupSpec (got {type(value)=})"
-                )
+_IMPLICIT_GROUP: Mapping[str, object] = {"zarr_format": 2, "attributes": {}}
+"""The document of a group that a flat hierarchy leaves out: a group with no attributes."""
+
+
+def _flat_nodes(data: Mapping[str, AnyArraySpec | AnyGroupSpec | AnyBaseGroupSpec]) -> StoredNodes:
+    """
+    Return each node's type and metadata document from a flat hierarchy.
+
+    The result is keyed as `nested_document` takes it: the path without its
+    leading `/`. A `GroupSpec` value's members are left out, because a
+    group's members are the entries under its path. Raises `ValueError` if
+    the root is an array, if a key other than the root's does not start with
+    `/` or has an empty segment, or if a value is not a Zarr V2 node spec.
+    """
+    nodes: dict[str, tuple[StoredNodeType | None, object]] = {}
+    for key, value in data.items():
+        if key and not key.startswith("/"):
+            msg = f'Invalid path: {key} does not start with "/".'
+            raise ValueError(msg)
+        if key and "" in key[1:].split("/"):
+            msg = f"Invalid path: {key} has an empty segment, so it names no node."
+            raise ValueError(msg)
+        if isinstance(value, ArraySpec):
+            if not key:
+                msg = "Got an ArraySpec as the root node. This is invalid."
+                raise ValueError(msg)
+            nodes[key[1:]] = ("array", value.to_metadata_json())
+        elif isinstance(value, BaseGroupSpec | GroupSpec):
+            nodes[key[1:]] = ("group", value.to_metadata_json())
         else:
-            # these are groups or arrays that belong to one of the member groups
-            # not great that we repeat this conditional dict initialization
-            if subparent_name not in submember_by_parent_name:
-                submember_by_parent_name[subparent_name] = {}
-            submember_by_parent_name[subparent_name][sep.join([root_name, *key_parts[2:]])] = value
-
-    # recurse
-    for subparent_name, submemb in submember_by_parent_name.items():
-        member_groups[subparent_name] = from_flat_group(submemb)
-
-    return GroupSpec(members={**member_groups, **member_arrays}, attributes=root_node.attributes)
+            msg = f"Value at '{key}' is not a v2 ArraySpec or GroupSpec (got {type(value)=})"
+            raise ValueError(msg)  # noqa: TRY004 (the flat API has always raised ValueError here)
+    return nodes
 
 
 def auto_chunks(data: object) -> tuple[int, ...]:

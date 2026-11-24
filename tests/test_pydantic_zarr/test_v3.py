@@ -24,7 +24,7 @@ from zarr_metadata.v3.chunk_key_encoding.default import (
 from zarr_metadata.v3.definition import ZARR_PYTHON_CONTEXT
 
 from pydantic_zarr._metadata import CORE_AND_EXTENSIONS_CONTEXT, CORE_CONTEXT
-from pydantic_zarr.core import AttributesBase, get_attribute, tuplify_json
+from pydantic_zarr.core import AttributesBase, tuplify_json
 from pydantic_zarr.v3 import (
     _SINGLE_BYTE_DATA_TYPES,
     AnyArraySpec,
@@ -349,6 +349,32 @@ def test_base_group_member_refused() -> None:
     """A `GroupSpec` is a complete hierarchy, so a `BaseGroupSpec` is not a member."""
     with pytest.raises(ValidationError, match="members"):
         GroupSpec(members={"a": BaseGroupSpec()})
+
+
+def test_from_flat_node_under_array() -> None:
+    """A flat hierarchy with a node under an array is refused."""
+    array = ArraySpec.from_array(np.ones(1))
+    with pytest.raises(ValueError, match="documents at 'a/b', but no group's at 'a'"):
+        GroupSpec.from_flat({"/a": array, "/a/b": array})
+
+
+def test_from_flat_key_without_leading_slash() -> None:
+    """A flat hierarchy key other than the root's must start with `/`."""
+    with pytest.raises(ValueError, match='Invalid path: a/b does not start with "/"'):
+        GroupSpec.from_flat({"a/b": GroupSpec()})
+
+
+def test_from_flat_array_at_root() -> None:
+    """A `GroupSpec` cannot be read from a flat hierarchy whose root is an array."""
+    with pytest.raises(ValueError, match="Got an ArraySpec as the root node"):
+        GroupSpec.from_flat({"": ArraySpec.from_array(np.ones(1))})
+
+
+@pytest.mark.parametrize("key", ["/", "//b", "/a//b", "/a/"])
+def test_from_flat_key_with_empty_segment(key: str) -> None:
+    """A flat hierarchy key with an empty segment names no node, so it is refused."""
+    with pytest.raises(ValueError, match=f"Invalid path: {key} has an empty segment"):
+        GroupSpec.from_flat({key: GroupSpec()})
 
 
 def test_mix_v3_v2_fails() -> None:
@@ -1267,28 +1293,6 @@ def test_group_spec_and_base_group_spec_are_siblings() -> None:
     assert root.to_stored_metadata_json() == {
         key: document for key, document in group.to_stored_metadata_json().items() if "/" not in key
     }
-
-
-def test_own_metadata_of_a_subclass_with_declared_fields() -> None:
-    """
-    A field that a `GroupSpec` subclass adds is not part of a plain
-    `BaseGroupSpec`, so the root leaves it out, and so does `to_flat`. With
-    every added field at its default, the hierarchy still goes through
-    `to_flat` and `from_flat` to the same dump. The root's attributes are a
-    deep copy.
-    """
-
-    class Declared(GroupSpec):
-        foo: int = 1
-        consolidated_metadata: dict[str, object] | None = None
-
-    group = Declared(members={"sub": Declared(members={})}, attributes={"a": [1]})
-    root = group.own_metadata()
-    assert root == BaseGroupSpec(attributes={"a": [1]})
-    assert group.to_flat()[""] == root
-    assert Declared.from_flat(group.to_flat()).model_dump() == group.model_dump()
-    assert root.attributes is not group.attributes
-    assert get_attribute(root.attributes, "a") is not get_attribute(group.attributes, "a")
 
 
 def test_typed_members() -> None:
@@ -2563,6 +2567,23 @@ def test_from_stored_metadata_json_array_with_members() -> None:
     stored = {**_TO_METADATA_JSON_ARRAY.to_stored_metadata_json(), "g/zarr.json": {}}
     with pytest.raises(ValueError, match="An array has no members"):
         ArraySpec.from_stored_metadata_json(stored)
+
+
+@pytest.mark.parametrize("key", ["zarr.json", "g/zarr.json"])
+def test_from_stored_metadata_json_group_document_with_members(key: str) -> None:
+    """
+    A group document with a `members` key is refused, because the key would
+    clash with the `members` field.
+    """
+    stored: dict[str, object] = {
+        "zarr.json": GroupSpec().to_metadata_json(),
+        "g/zarr.json": GroupSpec().to_metadata_json(),
+    }
+    stored[key] = {**GroupSpec().to_metadata_json(), "members": {"must_understand": False}}
+    with pytest.raises(
+        ValueError, match="has a 'members' key. A GroupSpec holds a group's members"
+    ):
+        GroupSpec.from_stored_metadata_json(stored)
 
 
 @pytest.mark.parametrize("parent", ["missing", "array"])
