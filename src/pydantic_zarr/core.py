@@ -1524,7 +1524,9 @@ def nested_document(
     JSON object is passed on as it is, so validation rejects it.
 
     Raises `ValueError` if a group's document has a `members` key, because
-    a group's metadata does not hold its members. Raises `ValueError` if a
+    that key would clash with the `members` field of a `GroupSpec`. The Zarr
+    V3 spec permits such a key as an extra field, but a `GroupSpec` cannot
+    hold it. Raises `ValueError` if a
     node's parent is an array, or if a node's parent is not in `nodes` and
     `implicit_group` is `None`. With `implicit_group`, a missing parent, the
     root included, is created with that document.
@@ -1537,8 +1539,9 @@ def nested_document(
             if "members" in document:
                 where = repr(path) if path else "the root"
                 msg = (
-                    f"The group document at {where} has a 'members' key, but a group's "
-                    "metadata does not hold its members."
+                    f"The group document at {where} has a 'members' key. A GroupSpec "
+                    "holds a group's members in its 'members' field, so it cannot read "
+                    "that key as part of the group's metadata."
                 )
                 raise ValueError(msg)
             members: dict[str, object] = {}

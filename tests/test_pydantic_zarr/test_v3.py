@@ -2571,7 +2571,10 @@ def test_from_stored_metadata_json_array_with_members() -> None:
 
 @pytest.mark.parametrize("key", ["zarr.json", "g/zarr.json"])
 def test_from_stored_metadata_json_group_document_with_members(key: str) -> None:
-    """A group document with a `members` key is refused: a group's metadata does not hold its members."""
+    """
+    A group document with a `members` key is refused, because the key would
+    clash with the `members` field.
+    """
     stored: dict[str, object] = {
         "zarr.json": GroupSpec().to_metadata_json(),
         "g/zarr.json": GroupSpec().to_metadata_json(),
