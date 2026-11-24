@@ -9,16 +9,24 @@ read back.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, NotRequired
 
 import numpy as np
 import pytest
-from pydantic import Field, ValidationError
+from pydantic import ConfigDict, Field, ValidationError, computed_field
 from typing_extensions import TypedDict
 from zarr_metadata import JSONValue  # noqa: TC002 (pydantic resolves field annotations at runtime)
+from zarr_metadata.v3.definition import (
+    ArrayExtraFieldDefinition,
+    GroupExtraFieldDefinition,
+    ZarrV3Context,
+)
 
 from pydantic_zarr import v2, v3
+from pydantic_zarr._metadata import CORE_CONTEXT
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 class Label(TypedDict):
@@ -38,6 +46,11 @@ def _label(text: str) -> Label:
 class TaggedArray(v3.ArraySpec):
     tag: Label = DEFAULT_LABEL
 
+    @computed_field
+    @property
+    def shape_label(self) -> Label:
+        return _label(f"{len(self.shape)}d")
+
 
 class RequiredLeaf(v3.GroupSpec):
     label: Label
@@ -50,7 +63,9 @@ class MidMembers(TypedDict, closed=True):
 
 
 class Mid(v3.GroupSpec[dict[str, object], MidMembers]):
+    model_config = ConfigDict(serialize_by_alias=True, validate_by_name=True)
     label: Label = DEFAULT_LABEL
+    aliased: Label = Field(default=DEFAULT_LABEL, alias="the-alias")
 
 
 class RootMembers(TypedDict, closed=True):
@@ -64,6 +79,42 @@ class Root(v3.GroupSpec[dict[str, object], RootMembers]):
 
 class BaseLabeled(v3.BaseGroupSpec):
     label: Label = DEFAULT_LABEL
+
+
+class Acme(TypedDict, closed=True):
+    level: int
+    must_understand: NotRequired[bool]
+
+
+ACME_SCOPE = CORE_CONTEXT.union(
+    ZarrV3Context(
+        group_extra_fields=[GroupExtraFieldDefinition(name="acme", configuration=Acme)],
+        array_extra_fields=[ArrayExtraFieldDefinition(name="acme", configuration=Acme)],
+    )
+)
+"""A scope that claims an extra field `acme`, which a reader must understand."""
+
+
+class AcmeArray(v3.ArraySpec):
+    zarr_scope = ACME_SCOPE
+    acme: Acme = Field(default_factory=lambda: {"level": 1, "must_understand": True})
+
+
+class AcmeMembers(TypedDict, closed=True):
+    array: AcmeArray
+
+
+class AcmeGroup(v3.GroupSpec[dict[str, object], AcmeMembers]):
+    zarr_scope = ACME_SCOPE
+    acme: Acme
+
+
+class AcmeRootMembers(TypedDict, closed=True):
+    group: AcmeGroup
+
+
+class AcmeRoot(v3.GroupSpec[dict[str, object], AcmeRootMembers]):
+    zarr_scope = ACME_SCOPE
 
 
 class TaggedArrayV2(v2.ArraySpec):
@@ -95,6 +146,7 @@ def _v3_hierarchy() -> Root:
     def mid(label: Label) -> Mid:
         return Mid(
             label=label,
+            aliased=label,
             members={
                 "leaf": RequiredLeaf(label=_label("required")),
                 "tagged": TaggedArray(**array, tag=_label("tagged")),
@@ -103,6 +155,18 @@ def _v3_hierarchy() -> Root:
         )
 
     return Root(members={"changed": mid(_label("changed")), "unchanged": mid(DEFAULT_LABEL)})
+
+
+def _acme_hierarchy() -> AcmeRoot:
+    array = v3.ArraySpec.from_array(np.arange(4)).model_dump()
+    return AcmeRoot(
+        members={
+            "group": AcmeGroup(
+                acme={"level": 2, "must_understand": True},
+                members={"array": AcmeArray(**array, acme={"level": 3})},
+            )
+        }
+    )
 
 
 def _v2_hierarchy() -> RootV2:
@@ -127,12 +191,19 @@ def _v2_hierarchy() -> RootV2:
             _v3_hierarchy(),
             {
                 "zarr.json": {"label": DEFAULT_LABEL},
-                "changed/zarr.json": {"label": _label("changed")},
+                "changed/zarr.json": {"label": _label("changed"), "the-alias": _label("changed")},
                 "changed/leaf/zarr.json": {"label": _label("required")},
-                "changed/tagged/zarr.json": {"tag": _label("tagged")},
+                "changed/tagged/zarr.json": {"tag": _label("tagged"), "shape_label": _label("1d")},
                 "changed/untagged/zarr.json": {"tag": DEFAULT_LABEL},
-                "unchanged/zarr.json": {"label": DEFAULT_LABEL},
+                "unchanged/zarr.json": {"label": DEFAULT_LABEL, "the-alias": DEFAULT_LABEL},
                 "unchanged/leaf/zarr.json": {"label": _label("required")},
+            },
+        ),
+        (
+            _acme_hierarchy(),
+            {
+                "group/zarr.json": {"acme": {"level": 2, "must_understand": True}},
+                "group/array/zarr.json": {"acme": {"level": 3}},
             },
         ),
         (
@@ -144,16 +215,17 @@ def _v2_hierarchy() -> RootV2:
             },
         ),
     ],
-    ids=["v3", "v2"],
+    ids=["v3", "v3-scoped", "v2"],
 )
 def test_added_fields_round_trip(
-    hierarchy: Root | RootV2, expected_documents: dict[str, dict[str, JSONValue]]
+    hierarchy: Root | AcmeRoot | RootV2, expected_documents: dict[str, dict[str, JSONValue]]
 ) -> None:
     """
     Every stored document holds the fields that its node's class adds, and
-    the hierarchy reads back equal, through its stored metadata and through
-    `to_flat` and `from_flat`. The fields are at their defaults or not, and
-    required or not, at every level.
+    the hierarchy reads back equal, through its stored metadata, through
+    `to_flat` and `from_flat`, and through `replace`. The fields are at their
+    defaults or not, required or not, aliased or computed, and claimed by the
+    class's scope or not, at every level.
     """
     stored = hierarchy.to_stored_metadata_json()
     for key, fields in expected_documents.items():
@@ -162,8 +234,37 @@ def test_added_fields_round_trip(
     assert type(hierarchy).from_stored_metadata_json(stored) == hierarchy
     if isinstance(hierarchy, Root):
         assert Root.from_flat(hierarchy.to_flat()) == hierarchy
+    elif isinstance(hierarchy, AcmeRoot):
+        assert AcmeRoot.from_flat(hierarchy.to_flat()) == hierarchy
     else:
         assert RootV2.from_flat(hierarchy.to_flat()) == hierarchy
+    replaced = hierarchy.replace(attributes={"changed": True}).to_stored_metadata_json()
+    members = {key: document for key, document in stored.items() if "/" in key}
+    assert {key: document for key, document in replaced.items() if "/" in key} == members
+
+
+def test_member_typed_as_a_base_class_keeps_added_fields() -> None:
+    """
+    A plain `GroupSpec` whose member is a subclass instance dumps the member
+    by its own class. So `replace` keeps the fields the member's class adds,
+    and `from_flat` and `from_stored_metadata_json` read them back as extra
+    fields of a plain member.
+    """
+    array = v3.ArraySpec.from_array(np.arange(4)).model_dump()
+    member = TaggedArray(**array, tag=_label("kept"))
+    group = v3.GroupSpec(members={"x": member})
+    assert group.model_dump()["members"]["x"]["tag"] == _label("kept")
+    replaced = group.replace(attributes={"a": 1})
+    stored = group.to_stored_metadata_json()
+    assert replaced.to_stored_metadata_json()["x/zarr.json"] == stored["x/zarr.json"]
+    for read in (
+        v3.GroupSpec.from_stored_metadata_json(stored),
+        v3.GroupSpec.from_flat(group.to_flat()),
+    ):
+        assert read.members["x"].extra_fields == {
+            "tag": _label("kept"),
+            "shape_label": _label("1d"),
+        }
 
 
 def test_flat_groups_hold_added_fields_as_extra_fields() -> None:
@@ -174,7 +275,9 @@ def test_flat_groups_hold_added_fields_as_extra_fields() -> None:
     """
     group = _v3_hierarchy()
     flat = group.to_flat()
-    assert flat["/changed"] == v3.BaseGroupSpec(extra_fields={"label": _label("changed")})
+    assert flat["/changed"] == v3.BaseGroupSpec(
+        extra_fields={"label": _label("changed"), "the-alias": _label("changed")}
+    )
     assert flat["/changed/leaf"] == v3.BaseGroupSpec(extra_fields={"label": _label("required")})
     assert type(flat["/changed/tagged"]) is TaggedArray
     root = group.own_metadata()

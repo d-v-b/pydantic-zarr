@@ -84,7 +84,7 @@ ARRAY_HEX_NAN = ARRAY.replace(fill_value="0x7fc00000")
 
 
 class _Noted(ArraySpec):
-    """An array spec with a field that a plain `GroupSpec` does not dump for its members."""
+    """An array spec with a field that it adds to its document."""
 
     note: JSONValue = {"must_understand": False, "text": "original"}  # noqa: RUF012
 
@@ -208,7 +208,7 @@ CASES: list[tuple[str, object, object, list[PatchOperation], list[PatchOperation
         [{"op": "replace", "path": "/members/x", "value": GroupSpec(members={}).model_dump()}],
     ),
     (
-        "member-subclass-field-not-in-the-group-document",
+        "member-subclass-field-in-the-group-document",
         GroupSpec(members={"x": _Noted(**ARRAY.model_dump())}),
         GroupSpec(
             members={
@@ -217,8 +217,8 @@ CASES: list[tuple[str, object, object, list[PatchOperation], list[PatchOperation
                 )
             }
         ),
-        [],
-        [],
+        [{"op": "replace", "path": "/members/x/note/text", "value": "changed"}],
+        [{"op": "replace", "path": "/members/x/note/text", "value": "changed"}],
     ),
     (
         "member-changes-from-group-to-base-group",

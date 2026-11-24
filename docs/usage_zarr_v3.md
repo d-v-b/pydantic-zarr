@@ -689,7 +689,9 @@ returns, holds it in its `extra_fields`. So the field is kept when a
 hierarchy is flattened, written and read back. A field that is not a valid
 extra field, such as `label: str`, is rejected. A field declared with
 `Field(exclude=True)` is not part of the document, so it is not checked, and
-it is not kept.
+it is not kept. The spec discourages top-level keys with
+`"must_understand": false` "in favor of the explicit use of extension points".
+So prefer attributes, or an extension that a scope claims, for new metadata.
 
 ```python
 from collections.abc import Mapping

@@ -626,6 +626,19 @@ def test_arrayspec_from_zarr_python_documents(dtype_example: DTypeExample) -> No
     assert arr_spec.model_dump() == observed
 
 
+def test_from_flat_node_under_array() -> None:
+    """A flat hierarchy with a node under an array is refused."""
+    array = ArraySpec.from_array(np.ones(1))
+    with pytest.raises(ValueError, match="documents at 'a/b', but no group's at 'a'"):
+        GroupSpec.from_flat({"/a": array, "/a/b": array})
+
+
+def test_from_flat_key_ends_with_slash() -> None:
+    """A flat hierarchy key that ends with `/` names no node, so it is refused."""
+    with pytest.raises(ValueError, match='Invalid path: / ends with "/"'):
+        GroupSpec.from_flat({"/": GroupSpec()})
+
+
 def test_mix_v3_v2_fails() -> None:
     from pydantic_zarr.v3 import ArraySpec as ArraySpecv3
 
