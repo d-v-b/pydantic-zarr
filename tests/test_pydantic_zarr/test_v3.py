@@ -24,7 +24,7 @@ from zarr_metadata.v3.chunk_key_encoding.default import (
 from zarr_metadata.v3.definition import ZARR_PYTHON_CONTEXT
 
 from pydantic_zarr._metadata import CORE_AND_EXTENSIONS_CONTEXT, CORE_CONTEXT
-from pydantic_zarr.core import AttributesBase, tuplify_json
+from pydantic_zarr.core import AttributesBase, get_attribute, tuplify_json
 from pydantic_zarr.v3 import (
     _SINGLE_BYTE_DATA_TYPES,
     AnyArraySpec,
@@ -1229,8 +1229,8 @@ def test_base_group_spec_zarr_round_trip() -> None:
 
 def test_narrowing_helpers() -> None:
     """
-    `is_array_spec` and `is_group_spec` tell flat-hierarchy values apart, and
-    `is_base_group_spec` holds for any group model, members or not.
+    `is_array_spec`, `is_group_spec` and `is_base_group_spec` tell
+    flat-hierarchy values apart.
     """
     from pydantic_zarr.v3 import is_base_group_spec
 
@@ -1242,8 +1242,53 @@ def test_narrowing_helpers() -> None:
     assert is_group_spec(group)
     assert not is_group_spec(base)
     assert is_base_group_spec(base)
-    assert is_base_group_spec(group)
+    assert not is_base_group_spec(group)
     assert not is_base_group_spec(array)
+
+
+def test_group_spec_and_base_group_spec_are_siblings() -> None:
+    """
+    A `GroupSpec` is a hierarchy and a `BaseGroupSpec` one group's own
+    metadata, so neither is a kind of the other. `own_metadata` returns a
+    hierarchy's root, with its attributes and extra fields, as a
+    `BaseGroupSpec`.
+    """
+    array: AnyArraySpec = ArraySpec(**_v3_array_kwargs())
+    extra = {"foo": {"must_understand": False}}
+    group: AnyGroupSpec = GroupSpec(attributes={"a": 1}, members={"x": array}, extra_fields=extra)
+    assert not isinstance(group, BaseGroupSpec)
+    assert not isinstance(BaseGroupSpec(), GroupSpec)
+    with pytest.raises(ValidationError):
+        BaseGroupSpec.model_validate(group)
+    root = group.own_metadata()
+    assert type(root) is BaseGroupSpec
+    assert root == BaseGroupSpec(attributes={"a": 1}, extra_fields=extra)
+    assert root == group.to_flat()[""]
+    assert root.to_stored_metadata_json() == {
+        key: document for key, document in group.to_stored_metadata_json().items() if "/" not in key
+    }
+
+
+def test_own_metadata_of_a_subclass_with_declared_fields() -> None:
+    """
+    A field that a `GroupSpec` subclass adds is not part of a plain
+    `BaseGroupSpec`, so the root leaves it out, and so does `to_flat`. With
+    every added field at its default, the hierarchy still goes through
+    `to_flat` and `from_flat` to the same dump. The root's attributes are a
+    deep copy.
+    """
+
+    class Declared(GroupSpec):
+        foo: int = 1
+        consolidated_metadata: dict[str, object] | None = None
+
+    group = Declared(members={"sub": Declared(members={})}, attributes={"a": [1]})
+    root = group.own_metadata()
+    assert root == BaseGroupSpec(attributes={"a": [1]})
+    assert group.to_flat()[""] == root
+    assert Declared.from_flat(group.to_flat()).model_dump() == group.model_dump()
+    assert root.attributes is not group.attributes
+    assert get_attribute(root.attributes, "a") is not get_attribute(group.attributes, "a")
 
 
 def test_typed_members() -> None:
