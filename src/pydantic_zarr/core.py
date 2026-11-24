@@ -1525,8 +1525,8 @@ def nested_document(
 
     Raises `ValueError` if a group's document has a `members` key, because
     that key would clash with the `members` field of a `GroupSpec`. The Zarr
-    V3 spec permits such a key as an extra field, but a `GroupSpec` cannot
-    hold it. Raises `ValueError` if a
+    V3 spec permits such a key as an extra field that a reader recognizes or
+    that says ``"must_understand": false``, but a `GroupSpec` cannot hold it. Raises `ValueError` if a
     node's parent is an array, or if a node's parent is not in `nodes` and
     `implicit_group` is `None`. With `implicit_group`, a missing parent, the
     root included, is created with that document.

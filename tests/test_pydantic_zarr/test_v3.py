@@ -2580,7 +2580,9 @@ def test_from_stored_metadata_json_group_document_with_members(key: str) -> None
         "g/zarr.json": GroupSpec().to_metadata_json(),
     }
     stored[key] = {**GroupSpec().to_metadata_json(), "members": {"must_understand": False}}
-    with pytest.raises(ValueError, match="has a 'members' key"):
+    with pytest.raises(
+        ValueError, match="has a 'members' key. A GroupSpec holds a group's members"
+    ):
         GroupSpec.from_stored_metadata_json(stored)
 
 
