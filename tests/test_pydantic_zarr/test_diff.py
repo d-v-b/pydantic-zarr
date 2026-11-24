@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 import jsonpatch
 import pytest
 from pydantic import BaseModel
+from zarr_metadata import JSONValue  # noqa: TC002 (pydantic resolves field annotations at runtime)
 
 from pydantic_zarr.core import NodeView, _json_equal, json_patch, node_patch
 from pydantic_zarr.v2 import ArraySpec as ArraySpecV2
@@ -85,7 +86,7 @@ ARRAY_HEX_NAN = ARRAY.replace(fill_value="0x7fc00000")
 class _Noted(ArraySpec):
     """An array spec with a field that a plain `GroupSpec` does not dump for its members."""
 
-    note: str = "original"
+    note: JSONValue = {"must_understand": False, "text": "original"}  # noqa: RUF012
 
 
 _MixedMembers = Mapping[str, ArraySpec | GroupSpec | BaseGroupSpec]
@@ -209,7 +210,13 @@ CASES: list[tuple[str, object, object, list[PatchOperation], list[PatchOperation
     (
         "member-subclass-field-not-in-the-group-document",
         GroupSpec(members={"x": _Noted(**ARRAY.model_dump())}),
-        GroupSpec(members={"x": _Noted(**ARRAY.model_dump(), note="changed")}),
+        GroupSpec(
+            members={
+                "x": _Noted(
+                    **ARRAY.model_dump(), note={"must_understand": False, "text": "changed"}
+                )
+            }
+        ),
         [],
         [],
     ),

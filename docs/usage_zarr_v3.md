@@ -679,3 +679,46 @@ written, so drop it first and consolidate the written hierarchy with
 `zarr.consolidate_metadata`. For the same reason, `read_documents` leaves it
 out when it reads a stored hierarchy (see [Reading and writing with
 zarr-python](#reading-and-writing-with-zarr-python)).
+
+### Fields that a subclass adds
+
+A field that a subclass adds is written as a top-level member of the node's
+document. The Zarr V3 spec does not define it, so it is an extra field, and
+the same rules apply. A plain spec, such as the `BaseGroupSpec` that `to_flat`
+returns, holds it in its `extra_fields`. So the field is kept when a
+hierarchy is flattened, written and read back. A field that is not a valid
+extra field, such as `label: str`, is rejected. A field declared with
+`Field(exclude=True)` is not part of the document, so it is not checked, and
+it is not kept.
+
+```python
+from collections.abc import Mapping
+from typing import Literal
+
+from typing_extensions import TypedDict
+
+from pydantic_zarr.v3 import GroupSpec
+
+
+class Label(TypedDict):
+    must_understand: Literal[False]
+    text: str
+
+
+class Labeled(GroupSpec):
+    label: Label = {"must_understand": False, "text": "none"}
+
+
+class Parent(GroupSpec[dict[str, object], Mapping[str, Labeled]]):
+    pass
+
+
+group = Parent(members={"sub": Labeled(label={"must_understand": False, "text": "important"})})
+stored = group.to_stored_metadata_json()
+print(stored["sub/zarr.json"]["label"])
+#> {'must_understand': False, 'text': 'important'}
+print(group.to_flat()["/sub"].extra_fields)
+#> {'label': {'must_understand': False, 'text': 'important'}}
+print(Parent.from_stored_metadata_json(stored) == group)
+#> True
+```

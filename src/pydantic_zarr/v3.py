@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import functools
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -114,6 +114,8 @@ from pydantic_zarr.core import (
     NodeView,
     PatchOperation,
     StoredNodes,
+    added_field_names,
+    added_fields,
     as_dtype_like,
     as_shape,
     canonicalize_fill_value,
@@ -359,6 +361,16 @@ class NodeSpec(ExtraFieldsBase):
     `ExtraFieldsBase`). They are written back as top-level members wherever
     the document is written: ``model_dump``, ``model_dump_json``,
     ``replace``, ``diff`` and ``to_stored_metadata_json``.
+
+    A field that a subclass adds is written as a top-level member of the
+    document too. The Zarr V3 spec does not define it, so it is an extra
+    field of the document, and the same rules apply to it. For example,
+    ``label: str`` is rejected, because a string is not an object with
+    ``"must_understand": false``. A plain spec, such as the `BaseGroupSpec`
+    that `to_flat` returns, holds an added field in its `extra_fields`. So
+    the field is kept when a hierarchy is flattened, written or read back. A
+    field declared with ``Field(exclude=True)`` is not dumped, so it is not
+    part of the document. Such a field is not checked, and it is not kept.
     """
 
     zarr_format: Literal[3] = 3
@@ -389,6 +401,14 @@ class NodeSpec(ExtraFieldsBase):
         scope = scope_from_context(context)
         return cls.zarr_scope if scope is None else scope
 
+    def _document_extra_fields(self) -> Mapping[str, object]:
+        """
+        Return the members of this spec's document that the Zarr V3 spec does
+        not define: the fields that this spec's class adds, and the extra fields.
+        """
+        added = added_fields(self, _library_class(type(self)))
+        return {**added, **self.extra_fields} if added else self.extra_fields
+
     def _refuse_unjudged(
         self,
         kind: ExtraFieldKind,
@@ -411,10 +431,11 @@ class NodeSpec(ExtraFieldsBase):
         Extra fields that a definition in `scope` claims are not checked here.
         That definition validates them when the whole document is read.
         """
-        extra = self.extra_fields
+        extra = self._document_extra_fields()
         scope_actual = CORE_AND_EXTENSIONS_CONTEXT if scope is None else scope
         node_type = "array" if kind is ArrayExtraFieldDefinition else "group"
-        refused = _refused_extra_fields(extra, kind, scope_actual)
+        added = added_field_names(type(self), _library_class(type(self)))
+        refused = _refused_extra_fields(extra, kind, scope_actual, added)
         if refused:
             raise ValueError(format_lines(refused, node_type))
         if type(self).zarr_scope_strict:
@@ -771,7 +792,10 @@ type ExtraFieldKind = type[ArrayExtraFieldDefinition | GroupExtraFieldDefinition
 
 
 def _refused_extra_fields(
-    extra_fields: Mapping[str, object], kind: ExtraFieldKind, scope: ZarrV3Context
+    extra_fields: Mapping[str, object],
+    kind: ExtraFieldKind,
+    scope: ZarrV3Context,
+    added: Collection[str] = (),
 ) -> list[str]:
     """
     Return the extra fields of a node document that the Zarr V3 spec's rules
@@ -789,14 +813,23 @@ def _refused_extra_fields(
     A waived field is an object with ``"must_understand": false``. It is kept
     as written, whatever else it contains. This is how `zarr-metadata`
     interprets the rule, and what its strategies generate.
+
+    `added` names the fields that the spec's class adds. Their messages say
+    so, because they are fields of the class, though not of the Zarr V3 spec.
     """
     problems: list[str] = []
     for key, value in extra_fields.items():
         if scope.claimant(kind, key) is not None:
             continue
         if not isinstance(value, Mapping):
+            what = (
+                "a field this class adds, which the Zarr V3 spec does not define, so it must be "
+                "an extra field the spec permits"
+                if key in added
+                else "not a field of this spec, and not an extra field the spec permits"
+            )
             problems.append(
-                f"{key}: not a field of this spec, and not an extra field the spec permits: "
+                f"{key}: {what}: "
                 'an extra field is an object that says "must_understand": false, '
                 f"got {value!r}"
             )
@@ -1660,12 +1693,14 @@ class _GroupNode(NodeSpec, Generic[TAttr]):
 
         On a class with `zarr_scope_strict` set, an extra field that nothing in
         the scope claims is rejected. Attributes and members are not part of
-        this check.
+        this check. A field that a subclass adds is checked as an extra field
+        (see `NodeSpec`).
         """
-        if not self.extra_fields:
+        extra = self._document_extra_fields()
+        if not extra:
             return self
         scope = self._scope(info.context)
-        document = {"zarr_format": 3, "node_type": "group", "attributes": {}, **self.extra_fields}
+        document = {"zarr_format": 3, "node_type": "group", "attributes": {}, **extra}
         try:
             ZarrV3GroupMetadataModel.from_json(document, context=scope)
         except MetadataValidationError as e:
@@ -1678,14 +1713,15 @@ class _GroupNode(NodeSpec, Generic[TAttr]):
         Return this group's own metadata as a `BaseGroupSpec`.
 
         The result contains the attributes and extra fields, without members.
-        A field that a subclass adds is not part of a plain `BaseGroupSpec`, so
-        it is left out. The result is constructed without validation, because
+        A field that a subclass adds is an extra field of the result, because
+        it is an extra field of the document (see `NodeSpec`). The result is
+        constructed without validation, because
         this spec is already validated. It may have been validated in a scope
         that a bare `BaseGroupSpec` would not use for its extra fields. It
         shares the attributes and extra fields with this spec.
         """
         return BaseGroupSpec.model_construct(
-            attributes=self.attributes, extra_fields=self.extra_fields
+            attributes=self.attributes, extra_fields=self._document_extra_fields()
         )
 
     def to_metadata_json(self) -> ZarrV3GroupMetadataJSON:
@@ -1925,9 +1961,9 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
         The result is not validated again, because this spec is already
         valid. It is a plain `BaseGroupSpec`, whatever this spec's class is.
         So it is typed with the widest attributes type, and a field that a
-        subclass of `GroupSpec` adds is left out. To read it as a
-        subclass of `BaseGroupSpec`, validate its `model_dump()` with that
-        class. Its attributes are a deep copy, so changing them does not
+        subclass of `GroupSpec` adds is one of its `extra_fields` (see
+        `NodeSpec`). To read it as a subclass of `BaseGroupSpec`, validate
+        its `model_dump()` with that class. Its attributes are a deep copy, so changing them does not
         change this spec.
         """
         return copy.deepcopy(self._own_metadata())
@@ -2076,8 +2112,7 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
         #                dimension_names=None)})
         ```
         """
-        from_flated = from_flat_group(data)
-        return cls.model_validate(from_flated.model_dump())
+        return cls.model_validate(_hierarchy_document(from_flat_group(data)))
 
     def to_flat(self, root_path: str = "") -> dict[str, AnyArraySpec | AnyBaseGroupSpec]:
         """
@@ -2237,6 +2272,42 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
             return True
 
         return model_like(self, other, include=include, exclude=exclude)
+
+
+def _library_class(spec_class: type[NodeSpec]) -> type[NodeSpec]:
+    """
+    Return the pydantic-zarr class that `spec_class` builds on: `ArraySpec`,
+    `GroupSpec` or `BaseGroupSpec`.
+
+    The fields of `spec_class` that this class does not declare are the
+    fields that `spec_class` adds.
+    """
+    if issubclass(spec_class, ArraySpec):
+        return ArraySpec
+    if issubclass(spec_class, GroupSpec):
+        return GroupSpec
+    if issubclass(spec_class, BaseGroupSpec):
+        return BaseGroupSpec
+    return NodeSpec
+
+
+def _hierarchy_document(node: object) -> dict[str, object]:
+    """
+    Return the document of the hierarchy rooted at `node`, with each node
+    dumped by its own class.
+
+    This is the input that a `GroupSpec` subclass validates. Unlike
+    `model_dump`, it keeps the fields that a member's class adds when the
+    group's members type is a base class of the member's class. Raises
+    `TypeError` if a node is not a Zarr V3 node spec.
+    """
+    checked = cast("AnyArraySpec | AnyGroupSpec | AnyBaseGroupSpec", _checked_node(node))
+    document: dict[str, object] = dict(checked.to_metadata_json())
+    if isinstance(checked, GroupSpec):
+        document["members"] = {
+            name: _hierarchy_document(member) for name, member in checked.members.items()
+        }
+    return document
 
 
 def _metadata_reader(
@@ -2442,10 +2513,11 @@ def from_flat_group(
     for subparent_name, submemb in submember_by_parent_name.items():
         member_groups[subparent_name] = from_flat_group(submemb)
 
+    root_metadata = root_node._own_metadata()
     return GroupSpec(
         members={**member_groups, **member_arrays},
-        attributes=root_node.attributes,
-        extra_fields=root_node.extra_fields,
+        attributes=root_metadata.attributes,
+        extra_fields=root_metadata.extra_fields,
     )
 
 
@@ -2805,8 +2877,10 @@ def to_flat(
     member's name with a `/` character, and so on recursively for each sub-member. The entries
     are sorted by key length.
 
-    A field that a subclass of `GroupSpec` or `BaseGroupSpec` adds is not
-    part of a plain `BaseGroupSpec`, so it is left out of the group's entry.
+    A field that a subclass of `GroupSpec` or `BaseGroupSpec` adds is an
+    extra field of the group's entry, because it is an extra field of the
+    group's document (see `NodeSpec`). An array is copied as it is, with its
+    class.
 
     Parameters
     ----------

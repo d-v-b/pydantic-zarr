@@ -181,6 +181,31 @@ EXTRA_FIELDS = "extra_fields"
 """The name of the field where `ExtraFieldsBase` stores a document's extra fields."""
 
 
+@cache
+def added_field_names(
+    spec_class: type[BaseModel], library_class: type[BaseModel]
+) -> frozenset[str]:
+    """Return the fields of `spec_class` that `library_class` does not declare. Cached per pair."""
+    return frozenset(spec_class.model_fields) - frozenset(library_class.model_fields)
+
+
+def added_fields(spec: BaseModel, library_class: type[BaseModel]) -> dict[str, object]:
+    """
+    Return the fields that the class of `spec` adds to `library_class`, as
+    they are written in the metadata document.
+
+    `library_class` is the pydantic-zarr class that the class of `spec`
+    builds on, such as `ArraySpec`. The values are dumped as `model_dump`
+    dumps them, with JSON arrays as tuples, as in `extra_fields`. A field
+    declared with `exclude=True` is not dumped, so it is not part of the
+    document and is left out.
+    """
+    names = added_field_names(type(spec), library_class)
+    if not names:
+        return {}
+    return {key: tuplify_json(value) for key, value in spec.model_dump(include=set(names)).items()}
+
+
 def flatten_extra_fields(document: dict[str, object]) -> dict[str, object]:
     """
     Move the entries of a dumped spec's `extra_fields` to the document's top level.

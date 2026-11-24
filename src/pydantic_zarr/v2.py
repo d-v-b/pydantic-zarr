@@ -63,6 +63,7 @@ from pydantic_zarr.core import (
     StoredNodes,
     StoredNodeType,
     StrictBase,
+    added_fields,
     as_dtype_like,
     as_shape,
     canonicalize_fill_value,
@@ -330,6 +331,13 @@ class ArraySpec(NodeSpec, ExtraFieldsBase, Generic[TAttr]):
         keys. zarr-python drops them when it reads or writes an array. Group
         metadata accepts no extra fields, because the spec says "Other keys
         MUST NOT be present".
+
+    A field that a subclass adds is written as a key of the `.zarray`
+    document too, so it is an extra field of the document. A plain
+    `ArraySpec` holds it in its `extra_fields`, so the field is kept when a
+    hierarchy is written and read back. A field declared with
+    ``Field(exclude=True)`` is not dumped, so it is not part of the document,
+    and it is not kept.
     """
 
     attributes: TAttr = Field(default={}, validate_default=True)
@@ -690,6 +698,27 @@ class _GroupNode(NodeSpec, Generic[TAttr]):
 
     attributes: TAttr = Field(default={}, validate_default=True)
 
+    @model_validator(mode="after")
+    def validate_metadata_document(self) -> Self:
+        """
+        Reject fields that a subclass adds to the group's metadata document.
+
+        A field that a subclass adds would be a key of the `.zgroup`
+        document. The Zarr V2 spec allows only `zarr_format` there, and says
+        "Other keys MUST NOT be present". So such a field cannot be written.
+        A field declared with ``Field(exclude=True)`` is not dumped, so it is
+        not part of the document, and it is allowed.
+        """
+        added = sorted(added_fields(self, _library_class(type(self))))
+        if added:
+            msg = (
+                f"Fields that this class adds: {added}. A Zarr V2 group's .zgroup document "
+                "may hold only zarr_format, so these fields cannot be stored. To keep a "
+                "field out of the metadata document, declare it with Field(exclude=True)."
+            )
+            raise ValueError(msg)
+        return self
+
     def _own_metadata(self) -> AnyBaseGroupSpec:
         """
         Return this group's own metadata as a `BaseGroupSpec`.
@@ -947,10 +976,10 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
 
         The result is not validated again, because this spec is already
         valid. It is a plain `BaseGroupSpec`, whatever this spec's class is.
-        So it is typed with the widest attributes type, and a field that a
-        subclass of `GroupSpec` adds is left out. To read it as a
-        subclass of `BaseGroupSpec`, validate its `model_dump()` with that
-        class. Its attributes are a deep copy, so changing them does not
+        So it is typed with the widest attributes type. A field that a
+        subclass declares with ``Field(exclude=True)`` is left out. To read
+        it as a subclass of `BaseGroupSpec`, validate its `model_dump()` with
+        that class. Its attributes are a deep copy, so changing them does not
         change this spec.
         """
         return copy.deepcopy(self._own_metadata())
@@ -1223,8 +1252,43 @@ class GroupSpec(_GroupNode[TAttr], Generic[TAttr, TMembers]):
         >>> GroupSpec.from_flat(flat)
         GroupSpec(zarr_format=2, attributes={'foo': 10}, members={'a': ArraySpec(zarr_format=2, attributes={}, shape=(10,), chunks=(10,), dtype='<i8', fill_value=0, order='C', filters=None, dimension_separator='/', compressor=None)})
         """
-        from_flated = from_flat_group(data)
-        return cls.model_validate(from_flated.model_dump())
+        return cls.model_validate(_hierarchy_document(from_flat_group(data)))
+
+
+def _library_class(spec_class: type[NodeSpec]) -> type[NodeSpec]:
+    """
+    Return the pydantic-zarr class that `spec_class` builds on: `ArraySpec`,
+    `GroupSpec` or `BaseGroupSpec`.
+
+    The fields of `spec_class` that this class does not declare are the
+    fields that `spec_class` adds.
+    """
+    if issubclass(spec_class, ArraySpec):
+        return ArraySpec
+    if issubclass(spec_class, GroupSpec):
+        return GroupSpec
+    if issubclass(spec_class, BaseGroupSpec):
+        return BaseGroupSpec
+    return NodeSpec
+
+
+def _hierarchy_document(node: object) -> dict[str, object]:
+    """
+    Return the document of the hierarchy rooted at `node`, with each node
+    dumped by its own class.
+
+    This is the input that a `GroupSpec` subclass validates. Unlike
+    `model_dump`, it keeps the fields that a member's class adds when the
+    group's members type is a base class of the member's class. Raises
+    `TypeError` if a node is not a Zarr V2 node spec.
+    """
+    checked = cast("AnyArraySpec | AnyGroupSpec | AnyBaseGroupSpec", _checked_node(node))
+    document: dict[str, object] = dict(checked.to_metadata_json())
+    if isinstance(checked, GroupSpec):
+        document["members"] = {
+            name: _hierarchy_document(member) for name, member in checked.members.items()
+        }
+    return document
 
 
 def _read_array_document(document: Mapping[str, object]) -> object:
@@ -1356,8 +1420,8 @@ def to_flat(
     joining `root_path` and the member's name with a `/` character. This repeats recursively for
     each sub-member. The entries are sorted by key length.
 
-    A field that a subclass of `GroupSpec` or `BaseGroupSpec` adds is not
-    part of a plain `BaseGroupSpec`, so it is left out of the group's entry.
+    A group's entry holds only its attributes, because a Zarr V2 group's
+    metadata holds nothing else. An array is copied as it is, with its class.
 
     Parameters
     ----------
